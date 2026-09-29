@@ -20,6 +20,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.ScrollableDefaults
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,6 +47,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -68,6 +72,10 @@ import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.SwitchButton
 import androidx.wear.compose.material3.Text
+import androidx.wear.compose.material3.onehandedgesture.OneHandedGestureAction
+import androidx.wear.compose.material3.onehandedgesture.OneHandedGesturePriority
+import androidx.wear.compose.material3.onehandedgesture.oneHandedGesture
+import androidx.wear.compose.material3.onehandedgesture.rememberOneHandedGestureConfiguration
 
 @Composable
 fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () -> Unit) {
@@ -127,12 +135,36 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
         }
     }
 
-    Box(Modifier.fillMaxSize()) {
+    // Primary one-handed gesture: on Pixel Watch this is double-pinch (Wear OS 7).
+    // The library no-ops on hardware that does not support the gesture framework.
+    val stopGesture = rememberOneHandedGestureConfiguration(
+        action = OneHandedGestureAction.Primary,
+        gestureId = "grok-stop-speaking",
+        priority = OneHandedGesturePriority.Clickable,
+    )
+    val screenModifier = Modifier
+        .fillMaxSize()
+        .then(
+            if (speaking) {
+                Modifier.oneHandedGesture(
+                    gestureConfiguration = stopGesture,
+                    onGestureLabel = "Stop Grok",
+                    onGesture = { vm.interrupt() },
+                )
+            } else {
+                Modifier
+            },
+        )
+        .tapToMuteCurrentReply(enabled = speaking, onTap = vm::toggleResponseMute)
+
+    Box(screenModifier) {
         ScreenScaffold(
             scrollState = listState,
             edgeButton = {
-                // Stop/Mute are pinned at the top while speaking; bottom edge keeps History / Retry.
+                // Stop is the bottom edge button while speaking (does not cover the transcript).
                 when {
+                    speaking ->
+                        EdgeButton(onClick = vm::interrupt, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
                     state.error != null && state.errorRetryable && micGranted ->
                         EdgeButton(onClick = vm::retry, buttonSize = EdgeButtonSize.Small) { Text("Retry") }
                     else ->
@@ -205,37 +237,43 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
                     onCheckedChange = vm::setVoiceBargeIn,
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Voice interrupt") },
-                    secondaryLabel = { Text(if (state.voiceBargeIn) "Talk over Grok" else "Tap Stop instead") },
+                    secondaryLabel = { Text(if (state.voiceBargeIn) "Talk over Grok" else "Double-pinch or Stop") },
                 )
             }
         }
-        }
-
-        // Pinned to the top of the round screen while Grok speaks (Mute above Stop).
-        if (speaking) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .fillMaxWidth()
-                    .padding(top = 10.dp, start = 14.dp, end = 14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                FilledTonalButton(
-                    onClick = vm::toggleResponseMute,
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text(if (state.responseMuted) "Muted" else "Mute") },
-                )
-                Spacer(Modifier.height(4.dp))
-                Button(
-                    onClick = vm::interrupt,
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Stop") },
-                )
-            }
         }
     }
 }
 
+
+
+/**
+ * Single-finger tap on the chat screen toggles mute for the current reply only.
+ * Events are observed on the final pass and never consumed, so buttons, the bottom
+ * Stop edge button, and scrolling keep working. A drag past touch slop is not a tap.
+ */
+private fun Modifier.tapToMuteCurrentReply(enabled: Boolean, onTap: () -> Unit): Modifier {
+    if (!enabled) return this
+    return pointerInput(onTap) {
+        val slop = viewConfiguration.touchSlop
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            val start = down.position
+            val pointerId = down.id
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Final)
+                val change = event.changes.firstOrNull { it.id == pointerId } ?: return@awaitEachGesture
+                val extraFinger = event.changes.any { it.id != pointerId && it.pressed }
+                if (change.isConsumed || extraFinger) return@awaitEachGesture
+                if ((change.position - start).getDistance() > slop) return@awaitEachGesture
+                if (!change.pressed) {
+                    onTap()
+                    return@awaitEachGesture
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun VolumeControls(percent: Int, onAdjust: (Int) -> Unit) {
@@ -304,7 +342,8 @@ private fun StatusHeader(state: ChatUiState, micGranted: Boolean) {
             SessionStatus.LISTENING -> "Listening…" to Color(0xFF4CAF50)
             SessionStatus.HEARING -> "Hearing you…" to Color(0xFF00BCD4)
             SessionStatus.THINKING -> "Thinking…" to Color(0xFFFFC107)
-            SessionStatus.SPEAKING -> "Grok is speaking" to Color(0xFFB388FF)
+            SessionStatus.SPEAKING ->
+                (if (state.responseMuted) "Muted" else "Grok is speaking") to Color(0xFFB388FF)
             SessionStatus.ERROR -> "Error" to MaterialTheme.colorScheme.error
         }
     }
@@ -338,6 +377,14 @@ private fun StatusHeader(state: ChatUiState, micGranted: Boolean) {
         }
         state.notice?.let {
             Text(it, style = MaterialTheme.typography.labelSmall, color = Color(0xFFFFC107), textAlign = TextAlign.Center)
+        }
+        if (state.status == SessionStatus.SPEAKING) {
+            Text(
+                if (state.responseMuted) "Tap to hear" else "Tap to mute",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
         }
         if (state.messages.isEmpty() && state.status == SessionStatus.LISTENING) {
             Text(

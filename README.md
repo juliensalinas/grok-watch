@@ -32,11 +32,12 @@ https://docs.x.ai/developers/model-capabilities/audio/text-to-speech (voice list
 ### Echo and barge-in
 The mic uses the `VOICE_COMMUNICATION` source, with `AcousticEchoCanceler`, `NoiseSuppressor`, and AGC turned on where the watch supports them. The session stays in `MODE_IN_COMMUNICATION` for AEC, but playback uses `USAGE_ASSISTANT` + `CONTENT_TYPE_SPEECH` on a large `MODE_STREAM` AudioTrack (prefer 48 kHz with explicit linear upsample from the API's 24 kHz PCM) so the watch speaker is not forced through the tinny telephony/SCO EQ.
 By default the app is **half-duplex**: while Grok is talking it sends silence instead of the mic signal, so the watch
-speaker can't trigger the server's voice detection. Tap **Stop** (pinned at the top of the screen while Grok speaks) to interrupt. That calls `response.cancel`,
+speaker can't trigger the server's voice detection. **Stop** is the bottom edge button while Grok speaks (it does not cover the transcript). It calls `response.cancel`,
 clears local playback, and sends `conversation.item.truncate` so Grok's context matches what you actually heard.
-**Mute**, directly above Stop at the top while Grok is speaking, pauses only the current spoken reply (AudioTrack playback). Captions keep
+The same stop action is also the Wear OS **primary one-handed gesture**: `Modifier.oneHandedGesture` with `OneHandedGestureAction.Primary` (Wear Compose Material3 1.7, Wear OS 7). On Pixel Watch that gesture is **double-pinch**. On watches without the gesture framework the library no-ops, and the bottom Stop button still works. The handler is registered only while Grok is speaking, at clickable priority, so it is not a touch-screen pinch detector.
+**Mute** is a single-finger tap on the screen while Grok is speaking (there is no Mute button). It pauses only the current spoken reply (AudioTrack playback). Captions keep
 updating. Tap again to hear the rest of that same reply. The next assistant turn always starts unmuted. Mute is not saved
-across responses or restarts. The bottom edge button stays **History** (or **Retry** on a recoverable error).
+across responses or restarts. Taps on buttons (Stop, volume, New chat, Voice interrupt) and drags that scroll the transcript are not treated as mute. When Grok is not speaking, the bottom edge button is **History** (or **Retry** on a recoverable error).
 Turn on **Voice interrupt** in the list to talk over Grok instead. This relies on the watch's echo cancellation.
 
 ### Volume
