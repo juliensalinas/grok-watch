@@ -61,7 +61,9 @@ class MicRecorder(
                     off += n
                 }
                 if (!running) break
-                if (off > 0) onChunk(if (off == bytesPerChunk) buf else buf.copyOf(off))
+                // PCM16 must be 2-byte aligned; drop a trailing odd byte rather than send a torn sample.
+                val even = off and 1.inv()
+                if (even > 0) onChunk(if (even == bytesPerChunk) buf else buf.copyOf(even))
             }
         }, "grok-mic").apply { start() }
         return true

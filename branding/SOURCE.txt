@@ -1,0 +1,6 @@
+Official xAI / Grok brand assets
+Downloaded from: https://data.x.ai/logos/xAI_Grok_Assets.zip
+Referenced by: https://x.ai/legal/brand-guidelines
+Used files: Grok_Logomark_Light.svg (white monochrome mark → ic_grok.xml, ic_launcher_foreground.xml)
+Background color: #0A0A0A (from Grok_Logomark_Dark.svg fill)
+Personal sideloaded Wear OS app; marks used only to refer to Grok.

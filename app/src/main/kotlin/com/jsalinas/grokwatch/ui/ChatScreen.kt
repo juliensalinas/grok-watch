@@ -18,12 +18,15 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.ScrollableDefaults
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -43,6 +46,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleStartEffect
@@ -51,6 +55,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumnDefaults
 import androidx.wear.compose.foundation.lazy.ScalingLazyListAnchorType
 import androidx.wear.compose.foundation.lazy.items
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
@@ -101,14 +106,16 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
 
     val listState = rememberScalingLazyListState(initialCenterItemIndex = 0)
     val messages = state.messages
-    val firstMessageIndex = 1
+    val bubbleParts = messages.flatMap { it.toBubbleParts() }
+    // StatusHeader + VolumeControls precede the message items.
+    val firstMessageIndex = 2
 
     // Auto-scroll to the newest text as it streams in (unless the user is scrolling).
     val lastText = messages.lastOrNull()?.text?.length ?: 0
-    LaunchedEffect(messages.size, lastText, state.error) {
+    LaunchedEffect(bubbleParts.size, lastText, state.error) {
         if (listState.isScrollInProgress) return@LaunchedEffect
-        val target = if (state.error != null) firstMessageIndex + messages.size
-        else if (messages.isNotEmpty()) firstMessageIndex + messages.lastIndex else 0
+        val target = if (state.error != null) firstMessageIndex + bubbleParts.size
+        else if (bubbleParts.isNotEmpty()) firstMessageIndex + bubbleParts.lastIndex else 0
         listState.scrollToItem(target)
         val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == target }
         val viewport = listState.layoutInfo.viewportSize.height
@@ -135,12 +142,20 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
             state = listState,
             contentPadding = contentPadding,
             anchorType = ScalingLazyListAnchorType.ItemStart,
+            // Default snap-fling + edge scaling clips tall bubbles mid-item; use free fling
+            // and flat scaling so long transcripts stay fully scrollable/readable.
+            flingBehavior = ScrollableDefaults.flingBehavior(),
+            scalingParams = ScalingLazyColumnDefaults.scalingParams(edgeScale = 1f, edgeAlpha = 1f),
+            autoCentering = null,
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             item { StatusHeader(state, micGranted) }
+            item { VolumeControls(percent = state.volumePercent, onAdjust = vm::adjustVolume) }
 
-            items(messages, key = { it.localId }) { msg -> MessageBubble(msg) }
+            items(bubbleParts, key = { "${it.messageLocalId}-${it.partIndex}" }) { part ->
+                MessageBubble(part)
+            }
 
             if (!micGranted) {
                 item {
@@ -192,6 +207,63 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
                 )
             }
         }
+    }
+}
+
+
+@Composable
+private fun VolumeControls(percent: Int, onAdjust: (Int) -> Unit) {
+    val bars = 5
+    val filled = ((percent.coerceIn(0, 100) / 100f) * bars).toInt().coerceIn(0, bars)
+    val btnBg = MaterialTheme.colorScheme.surfaceContainerHigh
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        VolumeStepButton(label = "−", background = btnBg, onClick = { onAdjust(-1) })
+        Spacer(Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                repeat(bars) { i ->
+                    val h = (6 + i * 3).dp
+                    Box(
+                        Modifier
+                            .width(5.dp)
+                            .height(h)
+                            .background(
+                                if (i < filled) Color(0xFFB388FF) else Color.Gray.copy(alpha = 0.35f),
+                                RoundedCornerShape(1.dp),
+                            ),
+                    )
+                }
+            }
+            Text(
+                "$percent%",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        VolumeStepButton(label = "+", background = btnBg, onClick = { onAdjust(1) })
+    }
+}
+
+@Composable
+private fun VolumeStepButton(label: String, background: Color, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .size(34.dp)
+            .background(background, CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, style = MaterialTheme.typography.titleMedium)
     }
 }
 
@@ -251,28 +323,111 @@ private fun StatusHeader(state: ChatUiState, micGranted: Boolean) {
     }
 }
 
+/** One scrollable slice of a chat bubble (long transcripts are split for Wear list scrolling). */
+private data class BubblePart(
+    val messageLocalId: Long,
+    val partIndex: Int,
+    val role: Role,
+    val text: String,
+    val final: Boolean,
+    val isFirst: Boolean,
+    val isLast: Boolean,
+)
+
+/** Split long transcripts into short Wear-friendly chunks so the whole message is reachable by scroll. */
+private fun ChatMessage.toBubbleParts(maxChars: Int = 180): List<BubblePart> {
+    val chunks = chunkTranscript(text, maxChars)
+    return chunks.mapIndexed { i, chunk ->
+        BubblePart(
+            messageLocalId = localId,
+            partIndex = i,
+            role = role,
+            text = chunk,
+            final = final,
+            isFirst = i == 0,
+            isLast = i == chunks.lastIndex,
+        )
+    }
+}
+
+private fun chunkTranscript(text: String, maxChars: Int): List<String> {
+    if (text.length <= maxChars) return listOf(text)
+    val parts = mutableListOf<String>()
+    // Prefer paragraph / line breaks, then sentences, then words.
+    val paragraphs = text.split(Regex("\n+")).filter { it.isNotBlank() }.ifEmpty { listOf(text) }
+    val buffer = StringBuilder()
+    fun flush() {
+        val s = buffer.toString().trim()
+        if (s.isNotEmpty()) parts += s
+        buffer.clear()
+    }
+    for (para in paragraphs) {
+        if (para.length <= maxChars) {
+            if (buffer.isNotEmpty() && buffer.length + 1 + para.length > maxChars) flush()
+            if (buffer.isNotEmpty()) buffer.append('\n')
+            buffer.append(para)
+            if (buffer.length >= maxChars / 2) flush()
+            continue
+        }
+        flush()
+        var remaining = para
+        while (remaining.length > maxChars) {
+            val window = remaining.substring(0, maxChars)
+            var cut = maxChars
+            for (sep in listOf(". ", "? ", "! ", "; ", ", ", " ")) {
+                val idx = window.lastIndexOf(sep)
+                if (idx >= maxChars / 3) {
+                    cut = idx + sep.length
+                    break
+                }
+            }
+            parts += remaining.substring(0, cut).trim()
+            remaining = remaining.substring(cut).trimStart()
+        }
+        if (remaining.isNotEmpty()) buffer.append(remaining)
+    }
+    flush()
+    return parts.ifEmpty { listOf(text) }
+}
+
 @Composable
-private fun MessageBubble(msg: ChatMessage) {
-    val isUser = msg.role == Role.USER
+private fun MessageBubble(part: BubblePart) {
+    val isUser = part.role == Role.USER
     val bg = if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer
     val fg = if (isUser) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+    val shape = when {
+        part.isFirst && part.isLast -> RoundedCornerShape(16.dp)
+        part.isFirst -> RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 6.dp, bottomEnd = 6.dp)
+        part.isLast -> RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp, bottomStart = 16.dp, bottomEnd = 16.dp)
+        else -> RoundedCornerShape(6.dp)
+    }
     Column(
         Modifier
             .fillMaxWidth()
             .padding(start = if (isUser) 14.dp else 0.dp, end = if (isUser) 0.dp else 14.dp)
-            .background(bg, RoundedCornerShape(16.dp))
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .background(bg, shape)
+            .padding(
+                horizontal = 10.dp,
+                vertical = if (part.isFirst || part.isLast) 6.dp else 2.dp,
+            ),
     ) {
+        if (part.isFirst) {
+            Text(
+                if (isUser) "You" else "Grok",
+                style = MaterialTheme.typography.labelSmall,
+                color = fg.copy(alpha = 0.7f),
+            )
+        }
+        val shown = part.text.ifBlank { "…" }
+        // Wear Material3 Text defaults to Overflow.Clip — override so nothing is cut mid-bubble.
         Text(
-            if (isUser) "You" else "Grok",
-            style = MaterialTheme.typography.labelSmall,
-            color = fg.copy(alpha = 0.7f),
-        )
-        val shown = msg.text.ifBlank { if (isUser) "…" else "…" }
-        Text(
-            shown + if (!msg.final && msg.text.isNotBlank()) " ▍" else "",
+            shown + if (part.isLast && !part.final && part.text.isNotBlank()) " ▍" else "",
+            modifier = Modifier.fillMaxWidth(),
             style = MaterialTheme.typography.bodyMedium,
             color = fg,
+            softWrap = true,
+            overflow = TextOverflow.Visible,
+            maxLines = Int.MAX_VALUE,
         )
     }
 }

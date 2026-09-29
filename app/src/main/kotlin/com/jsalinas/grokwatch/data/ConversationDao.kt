@@ -22,9 +22,28 @@ interface ConversationDao {
     @Insert
     suspend fun insertMessage(message: MessageEntity): Long
 
+    @Query("UPDATE messages SET text = :text WHERE id = :id")
+    suspend fun updateMessageText(id: Long, text: String)
+
     @Query("UPDATE conversations SET updatedAt = :updatedAt WHERE id = :id")
     suspend fun touch(id: Long, updatedAt: Long)
 
     @Query("DELETE FROM conversations WHERE id = :id")
     suspend fun deleteConversation(id: Long)
+
+    /**
+     * Keep only the [limit] most recently updated conversations.
+     * Double subquery is required: SQLite disallows DELETE … WHERE id NOT IN (SELECT … FROM same table).
+     */
+    @Query(
+        """
+        DELETE FROM conversations
+        WHERE id NOT IN (
+            SELECT id FROM (
+                SELECT id FROM conversations ORDER BY updatedAt DESC LIMIT :limit
+            )
+        )
+        """,
+    )
+    suspend fun pruneOldConversations(limit: Int)
 }

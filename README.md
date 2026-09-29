@@ -17,7 +17,7 @@ voice conversation with Grok through the xAI **Grok Voice Agent (speech-to-speec
 | Endpoint | `wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-2.0` |
 | Auth | `Authorization: Bearer <XAI_API_KEY>` header on the WebSocket upgrade |
 | Model | `grok-voice-think-fast-2.0`: the docs call it the "Flagship voice model"; `grok-voice-latest` is an alias for it. It's pinned here, as the docs recommend for production. Override with `-PgrokModel=grok-voice-latest`. |
-| Voice | `eve` (docs default, "energetic and upbeat"). You can pick any of the 28 built-in voices (e.g. `ara`, `rex`, `sal`, `leo`, `helios`, `celeste`…) with `-PgrokVoice=ara`. |
+| Voice | `rex` (male: confident, clear, professional — xAI built-in). Override with `-PgrokVoice=ara` / `eve` / `leo` / … |
 | Turn-taking | `turn_detection: server_vad` (the server detects the end of speech and starts the reply) |
 | Audio in | `audio/pcm` PCM16 LE mono, 16 kHz (falls back to 24/48 kHz if the mic can't do 16 kHz), base64 in `input_audio_buffer.append` |
 | Audio out | `audio/pcm` PCM16 LE mono, 24 kHz (API default/recommended) from `response.output_audio.delta` |
@@ -30,11 +30,14 @@ https://docs.x.ai/developers/rest-api-reference/inference/voice ·
 https://docs.x.ai/developers/model-capabilities/audio/text-to-speech (voice list)
 
 ### Echo and barge-in
-The mic uses the `VOICE_COMMUNICATION` source, with `AcousticEchoCanceler`, `NoiseSuppressor`, and AGC turned on where the watch supports them. Audio runs in `MODE_IN_COMMUNICATION`.
+The mic uses the `VOICE_COMMUNICATION` source, with `AcousticEchoCanceler`, `NoiseSuppressor`, and AGC turned on where the watch supports them. The session stays in `MODE_IN_COMMUNICATION` for AEC, but playback uses `USAGE_ASSISTANT` + `CONTENT_TYPE_SPEECH` on a large `MODE_STREAM` AudioTrack (prefer 48 kHz with explicit linear upsample from the API's 24 kHz PCM) so the watch speaker is not forced through the tinny telephony/SCO EQ.
 By default the app is **half-duplex**: while Grok is talking it sends silence instead of the mic signal, so the watch
 speaker can't trigger the server's voice detection. Tap **Stop** (the edge button) to interrupt. That calls `response.cancel`,
 clears local playback, and sends `conversation.item.truncate` so Grok's context matches what you actually heard.
 Turn on **Voice interrupt** in the list to talk over Grok instead. This relies on the watch's echo cancellation.
+
+### Volume
+On-screen **− / +** controls on the conversation screen adjust `STREAM_MUSIC` (the stream Android maps `USAGE_ASSISTANT` AudioTrack playback onto). The preferred level is stored in SharedPreferences and re-applied when a session starts. Compact bars + percent sit between the buttons so captions stay readable. Physical crown / system volume changes on that stream are also reflected in the UI.
 
 ## Build
 
@@ -88,7 +91,7 @@ app/src/main/kotlin/com/jsalinas/grokwatch/
   realtime/GrokRealtimeClient.kt   OkHttp WebSocket + xAI realtime events
   audio/MicRecorder.kt             AudioRecord (VOICE_COMMUNICATION + AEC/NS/AGC)
   audio/PcmPlayer.kt               streaming AudioTrack with instant flush (barge-in)
-  audio/AudioRouting.kt            communication mode, speaker/BT routing, audio focus
+  audio/AudioRouting.kt            communication mode, speaker/BT routing, audio focus, playback volume
   ui/ChatViewModel.kt              session state machine, transcripts, persistence
   ui/ChatScreen.kt, HistoryScreen.kt, GrokWatchRoot.kt (SwipeDismissableNavHost)
   data/                            Room: conversations + messages

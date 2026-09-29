@@ -15,8 +15,8 @@ val localProps = Properties().apply {
 val xaiApiKey: String = providers.environmentVariable("XAI_API_KEY").orNull
     ?.takeIf { it.isNotBlank() }
     ?: localProps.getProperty("XAI_API_KEY", "")
-// Voice + model are configurable without code changes (-PgrokVoice=ara, -PgrokModel=...).
-val grokVoice: String = (findProperty("grokVoice") as String?) ?: "eve"
+// Voice + model are configurable without code changes (-PgrokVoice=rex, -PgrokModel=...).
+val grokVoice: String = (findProperty("grokVoice") as String?) ?: "rex"
 val grokModel: String = (findProperty("grokModel") as String?) ?: "grok-voice-think-fast-2.0"
 
 fun String.asBuildConfigString() = "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""

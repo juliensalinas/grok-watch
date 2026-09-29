@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.util.Base64
 import android.util.Log
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
@@ -43,6 +42,8 @@ data class ChatMessage(
     val itemId: String? = null,
     val responseId: String? = null,
     val persisted: Boolean = false,
+    /** Room row id once saved; used to rewrite user text when a longer final / concat arrives. */
+    val dbId: Long? = null,
 )
 
 data class ChatUiState(
@@ -54,6 +55,8 @@ data class ChatUiState(
     val conversationId: Long? = null,
     val title: String? = null,
     val voiceBargeIn: Boolean = false,
+    /** Preferred playback volume 0–100 for STREAM_MUSIC (ASSISTANT AudioTrack). */
+    val volumePercent: Int = 70,
     val apiKeyMissing: Boolean = BuildConfig.XAI_API_KEY.isBlank(),
 )
 
@@ -68,7 +71,10 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     private val routing = AudioRouting(app)
 
     private val _state = MutableStateFlow(
-        ChatUiState(voiceBargeIn = prefs.getBoolean(PREF_BARGE_IN, false)),
+        ChatUiState(
+            voiceBargeIn = prefs.getBoolean(PREF_BARGE_IN, false),
+            volumePercent = prefs.getInt(PREF_VOLUME, DEFAULT_VOLUME_PERCENT).coerceIn(0, 100),
+        ),
     )
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
@@ -91,12 +97,24 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     private var liveTranscription = true
     private var sessionConfirmed = false
     private var pendingUserLocalId: Long? = null
+    /** Local id of the in-progress user turn (may span multiple VAD item_ids). */
+    private var openUserLocalId: Long? = null
+    /** item_id → user bubble localId (survives turn seal so late completed still merges). */
+    private val itemIdToUserLocalId = mutableMapOf<String, Long>()
+    /** Ordered item_ids per user bubble (for concatenating multi-VAD segments). */
+    private val userBubbleItemOrder = mutableMapOf<Long, MutableList<String>>()
+    /** Per-item cumulative transcript (keyed by server item_id or "_pending"). */
+    private val itemSegmentText = mutableMapOf<String, String>()
     private var currentResponseId: String? = null
     private var currentAssistantItemId: String? = null
     @Volatile private var responseActive = false
+    /** Accept assistant PCM until response.done (trailing deltas after done are dropped). */
+    @Volatile private var acceptAssistantAudio = false
     private var responseAudioStartFrame: Long? = null
     private var tickerJob: Job? = null
     private var noticeJob: Job? = null
+    /** Reused silence buffer for half-duplex mic gate (avoids per-chunk allocations / GC jank). */
+    private var silenceBuf: ByteArray = EMPTY_BYTES
 
     init {
         conversationId?.let { id ->
@@ -144,7 +162,18 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         }
         _state.update { it.copy(status = SessionStatus.CONNECTING) }
 
-        routing.begin()
+        val preferredVol = _state.value.volumePercent
+        routing.begin(preferredVolumePercent = preferredVol)
+        routing.startWatchingVolume { pct ->
+            // Physical crown / system volume — sync UI and persist preferred level.
+            prefs.edit { putInt(PREF_VOLUME, pct) }
+            _state.update { it.copy(volumePercent = pct) }
+        }
+        val applied = routing.getVolumePercent()
+        if (applied != preferredVol) {
+            prefs.edit { putInt(PREF_VOLUME, applied) }
+            _state.update { it.copy(volumePercent = applied) }
+        }
         val p = PcmPlayer(OUTPUT_RATE).also { it.start() }
         val m = MicRecorder()
         synchronized(lock) {
@@ -155,9 +184,15 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             sessionConfirmed = false
             liveTranscription = true
             responseActive = false
+            acceptAssistantAudio = false
             currentResponseId = null
             currentAssistantItemId = null
             pendingUserLocalId = null
+            openUserLocalId = null
+            itemIdToUserLocalId.clear()
+            userBubbleItemOrder.clear()
+            itemSegmentText.clear()
+            silenceBuf = EMPTY_BYTES
         }
         // Start capturing immediately (buffered until the socket is ready) to minimise latency.
         if (!m.start { chunk -> onMicChunk(gen, chunk) }) {
@@ -208,6 +243,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             val t = Triple(client, mic, player)
             client = null; mic = null; player = null; wsReady = false; preBuffer.clear()
             responseActive = false
+            acceptAssistantAudio = false
             t
         }
         m?.stop()
@@ -227,6 +263,17 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         _state.update { it.copy(voiceBargeIn = enabled) }
     }
 
+    /** Raise or lower STREAM_MUSIC (matches ASSISTANT AudioTrack playback) by one step. */
+    fun adjustVolume(delta: Int) {
+        val pct = if (delta == 0) {
+            routing.getVolumePercent()
+        } else {
+            routing.adjustVolume(delta)
+        }
+        prefs.edit { putInt(PREF_VOLUME, pct) }
+        _state.update { it.copy(volumePercent = pct) }
+    }
+
     /** Tap-to-interrupt: stop Grok talking and go back to listening. */
     fun interrupt() {
         synchronized(lock) { interruptLocked(cancelServer = true) }
@@ -238,7 +285,8 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         val c = client
         val start = responseAudioStartFrame
         val playedMs = if (start != null) ((p.playedFrames() - start).coerceAtLeast(0) * 1000 / OUTPUT_RATE) else 0
-        p.flush()
+        acceptAssistantAudio = false
+        p.flush() // barge-in / Stop only — never on half-duplex mic silence
         responseAudioStartFrame = null
         if (responseActive && cancelServer) c?.cancelResponse()
         // Tell the server how much the user actually heard so the context matches reality.
@@ -260,14 +308,24 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         }
         val p = player
         // Half-duplex echo guard: unless voice barge-in is enabled, send silence while Grok is audible
-        // so the watch speaker never triggers the server VAD. (AEC is still on in both modes.)
+        // so the watch speaker never triggers the server VAD. Do NOT flush AudioTrack here — that
+        // would create audible gaps. (AEC is still on in both modes.)
         val gated = !_state.value.voiceBargeIn && p != null && p.isAudible()
-        c.appendAudio(if (gated) ByteArray(chunk.size) else chunk)
+        if (gated) {
+            if (silenceBuf.size != chunk.size) silenceBuf = ByteArray(chunk.size)
+            c.appendAudio(silenceBuf)
+        } else {
+            c.appendAudio(chunk)
+        }
     }
 
     private fun onAssistantAudio(bytes: ByteArray) {
+        // Drop empty / torn PCM and late deltas after response.done / barge-in.
+        if (bytes.size < 2) return
+        if (!acceptAssistantAudio) return
         val p = player ?: return
         synchronized(lock) {
+            if (!acceptAssistantAudio) return
             if (responseAudioStartFrame == null) responseAudioStartFrame = p.enqueuedFrames()
         }
         p.enqueue(bytes)
@@ -306,6 +364,12 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             if (gen == sessionGen) onAssistantAudio(bytes)
         }
 
+        override fun onAssistantAudioEnd() {
+            if (gen != sessionGen) return
+            // Only clear if no newer response has already started (responseActive true again).
+            if (!responseActive) acceptAssistantAudio = false
+        }
+
         override fun onFailure(error: RealtimeError) {
             if (gen != sessionGen) return
             viewModelScope.launch { failAndStop(error.message, error.retryable) }
@@ -336,10 +400,25 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                         interruptLocked(cancelServer = false)
                     }
                     val itemId = e.optString("item_id").ifBlank { null }
-                    if (itemId == null || findByItemId(itemId) == null) {
-                        val msg = newMessage(Role.USER, "", itemId)
-                        if (itemId == null) pendingUserLocalId = msg.localId
-                        appendMessage(msg)
+                    // Reuse the open user bubble across brief VAD pauses so one spoken question
+                    // stays a single caption (segments are concatenated on completed/updated).
+                    val openId = openUserLocalId
+                    val openMsg = openId?.let { id -> _state.value.messages.firstOrNull { it.localId == id } }
+                    // Reuse while this turn is still open (sealed on response.created), even if
+                    // an early transcription.completed already persisted partial text.
+                    val reuseOpen = openMsg != null && openMsg.role == Role.USER && openUserLocalId == openMsg.localId
+                    when {
+                        itemId != null && findByItemId(itemId) != null -> {
+                            // Already tracking this item.
+                        }
+                        reuseOpen -> {
+                            val lid = openMsg.localId
+                            if (itemId != null) rememberUserItem(lid, itemId)
+                            if (itemId == null) pendingUserLocalId = lid
+                        }
+                        else -> {
+                            beginOpenUserTurn(itemId)
+                        }
                     }
                 }
                 setStatus(SessionStatus.HEARING)
@@ -358,12 +437,20 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
 
             "response.created" -> {
                 val rid = e.optJSONObject("response")?.optString("id")?.ifBlank { null }
+                var sealPersist: ChatMessage? = null
                 synchronized(lock) {
+                    // Close the user turn so the next utterance gets a new bubble; late
+                    // transcription.completed still finds the bubble via itemIdToUserLocalId.
+                    sealPersist = sealOpenUserTurnLocked()
                     responseActive = true
+                    acceptAssistantAudio = true
                     currentResponseId = rid
                     currentAssistantItemId = null
                     responseAudioStartFrame = null
                     appendMessage(newMessage(Role.ASSISTANT, "", null, rid))
+                }
+                sealPersist?.let { sealed ->
+                    if (sealed.dbId != null) persistUpdate(sealed) else persist(sealed)
                 }
                 setStatus(SessionStatus.THINKING)
             }
@@ -386,24 +473,29 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             "response.output_audio_transcript.done" -> {
                 val full = e.optString("transcript")
                 if (full.isNotBlank()) {
+                    // Authoritative final caption — prefer it over possibly incomplete delta text.
                     updateAssistant(e.optString("response_id").ifBlank { null }) {
-                        if (it.text.isBlank()) it.copy(text = full) else it
+                        val text = if (full.length >= it.text.length) full else it.text
+                        it.copy(text = text)
                     }
                 }
             }
 
-            "response.output_audio.delta", "response.audio.delta" -> {
-                val b64 = e.optString("delta")
-                if (b64.isNotEmpty()) onAssistantAudio(Base64.decode(b64, Base64.DEFAULT))
-            }
+            // Audio PCM is delivered via onBinaryAudio (decoded off the OkHttp thread in the client).
+            // Ignore the JSON event body here to avoid a second Base64 decode on the reader thread.
+            "response.output_audio.delta", "response.audio.delta" -> Unit
 
             "response.done" -> {
                 val resp = e.optJSONObject("response")
                 val rid = resp?.optString("id")?.ifBlank { null }
                 val status = resp?.optString("status")
+                val embedded = extractAssistantTranscript(resp)
                 synchronized(lock) { responseActive = false }
+                // acceptAssistantAudio cleared via onAssistantAudioEnd (ordered after in-flight deltas)
                 updateAssistant(rid) {
-                    val t = if (status == "cancelled" && it.text.isNotBlank()) it.text.trimEnd() + " …" else it.text
+                    var t = it.text
+                    if (embedded != null && embedded.length >= t.length) t = embedded
+                    if (status == "cancelled" && t.isNotBlank()) t = t.trimEnd() + " …"
                     it.copy(text = t, final = true)
                 }
                 finalizeAssistant(rid)
@@ -459,36 +551,166 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
 
     private fun findByItemId(itemId: String) = _state.value.messages.firstOrNull { it.itemId == itemId }
 
+    private fun rememberUserItem(localId: Long, itemId: String) {
+        itemIdToUserLocalId[itemId] = localId
+        val order = userBubbleItemOrder.getOrPut(localId) { mutableListOf() }
+        if (itemId !in order) order += itemId
+    }
+
+    private fun joinedUserBubbleText(localId: Long): String {
+        val order = userBubbleItemOrder[localId] ?: return ""
+        return order.mapNotNull { id -> itemSegmentText[id]?.takeIf { it.isNotBlank() } }
+            .joinToString(" ")
+    }
+
+    private fun beginOpenUserTurn(itemId: String?) {
+        val msg = newMessage(Role.USER, "", itemId)
+        openUserLocalId = msg.localId
+        userBubbleItemOrder[msg.localId] = mutableListOf()
+        if (itemId != null) {
+            rememberUserItem(msg.localId, itemId)
+        } else {
+            pendingUserLocalId = msg.localId
+            rememberUserItem(msg.localId, "_pending")
+        }
+        val msgs = _state.value.messages.toMutableList()
+        val last = msgs.lastOrNull()
+        if (last != null && last.role == Role.ASSISTANT && !last.final) {
+            msgs.add(msgs.size - 1, msg)
+            _state.update { it.copy(messages = msgs) }
+        } else {
+            appendMessage(msg)
+        }
+    }
+
+    /**
+     * Mark the current user turn closed for bubble reuse. Persist if we already have text and
+     * have not written Room yet (completed may still arrive later and grow the text).
+     */
+    private fun sealOpenUserTurnLocked(): ChatMessage? {
+        val openId = openUserLocalId ?: return null
+        openUserLocalId = null
+        pendingUserLocalId = null
+        val msgs = _state.value.messages.toMutableList()
+        val idx = msgs.indexOfFirst { it.localId == openId }
+        if (idx < 0) return null
+        val cur = msgs[idx]
+        val text = joinedUserBubbleText(openId).ifBlank { cur.text }
+        if (text.isBlank()) {
+            msgs.removeAt(idx)
+            _state.update { it.copy(messages = msgs) }
+            return null
+        }
+        if (cur.dbId != null) {
+            if (text.length > cur.text.length) {
+                val updated = cur.copy(text = text, final = true, persisted = true)
+                msgs[idx] = updated
+                _state.update { it.copy(messages = msgs) }
+                return updated
+            }
+            return null
+        }
+        if (cur.persisted) {
+            if (text.length > cur.text.length) {
+                msgs[idx] = cur.copy(text = text, final = true)
+                _state.update { it.copy(messages = msgs) }
+            }
+            return null
+        }
+        val updated = cur.copy(text = text, final = true, persisted = false)
+        msgs[idx] = updated
+        _state.update { it.copy(messages = msgs) }
+        return updated
+    }
+
+    /**
+     * Merge a cumulative ASR snapshot into one segment:
+     * - never shrink on interim updates
+     * - prefer a longer authoritative final; keep the longer live text if final is shorter
+     */
+    private fun mergeSegmentText(current: String, incoming: String, final: Boolean): String {
+        if (incoming.isBlank()) return current
+        if (current.isBlank()) return incoming
+        if (incoming.length >= current.length) return incoming
+        return current
+    }
+
+    private fun resolveUserMessageIndex(msgs: List<ChatMessage>, idKey: String?): Int {
+        if (idKey != null) {
+            itemIdToUserLocalId[idKey]?.let { lid ->
+                val i = msgs.indexOfFirst { it.localId == lid && it.role == Role.USER }
+                if (i >= 0) return i
+            }
+            val byItem = msgs.indexOfFirst { it.role == Role.USER && it.itemId == idKey }
+            if (byItem >= 0) return byItem
+        }
+        val pending = pendingUserLocalId ?: openUserLocalId
+        if (pending != null) {
+            val i = msgs.indexOfFirst { it.localId == pending && it.role == Role.USER }
+            if (i >= 0) return i
+        }
+        return -1
+    }
+
     private fun upsertUserTranscript(itemId: String, transcript: String, final: Boolean) {
         var toPersist: ChatMessage? = null
+        var toUpdate: ChatMessage? = null
         synchronized(lock) {
-            val msgs = _state.value.messages.toMutableList()
-            var idx = if (itemId.isNotBlank()) msgs.indexOfFirst { it.itemId == itemId && it.role == Role.USER } else -1
+            var msgs = _state.value.messages.toMutableList()
+            val idKey = itemId.ifBlank { null }
+
+            var idx = resolveUserMessageIndex(msgs, idKey)
             if (idx < 0) {
-                val pending = pendingUserLocalId
-                idx = if (pending != null) msgs.indexOfFirst { it.localId == pending } else -1
-                if (idx >= 0) pendingUserLocalId = null
+                // Completed/updated can race ahead of speech_started (esp. completed-only fallback).
+                beginOpenUserTurn(idKey)
+                msgs = _state.value.messages.toMutableList()
+                idx = resolveUserMessageIndex(msgs, idKey)
+                if (idx < 0) idx = msgs.indexOfFirst { it.localId == openUserLocalId }
+                if (idx < 0) return
             }
-            if (idx < 0) {
-                // No placeholder: insert before an in-progress assistant reply, if any.
-                val msg = newMessage(Role.USER, "", itemId.ifBlank { null })
-                val last = msgs.lastOrNull()
-                if (last != null && last.role == Role.ASSISTANT && !last.final) msgs.add(msgs.size - 1, msg) else msgs.add(msg)
-                idx = msgs.indexOf(msg)
+            if (idKey != null && pendingUserLocalId != null) pendingUserLocalId = null
+
+            val turnLocalId = msgs[idx].localId
+            val segmentKey = idKey ?: "_pending"
+            rememberUserItem(turnLocalId, segmentKey)
+
+            val prevSeg = itemSegmentText[segmentKey].orEmpty()
+            val mergedSeg = mergeSegmentText(prevSeg, transcript, final)
+            if (mergedSeg.isNotBlank()) itemSegmentText[segmentKey] = mergedSeg
+
+            val nextText = joinedUserBubbleText(turnLocalId).ifBlank {
+                mergeSegmentText(msgs[idx].text, transcript, final)
             }
+
             val cur = msgs[idx]
-            if (cur.persisted) return
+            if (final && nextText.isBlank() && cur.text.isBlank()) {
+                msgs.removeAt(idx)
+                if (openUserLocalId == cur.localId) openUserLocalId = null
+                _state.update { it.copy(messages = msgs) }
+                return
+            }
+
+            // Never shrink displayed user text when a shorter interim (or short final) arrives.
+            val display = if (nextText.length >= cur.text.length) nextText else cur.text
+
             val updated = cur.copy(
-                text = transcript,
-                final = final,
-                itemId = cur.itemId ?: itemId.ifBlank { null },
-                persisted = final && transcript.isNotBlank(),
+                text = display,
+                final = cur.final || final,
+                itemId = cur.itemId ?: idKey,
             )
-            if (final && transcript.isBlank()) msgs.removeAt(idx) else msgs[idx] = updated
+            msgs[idx] = updated
             _state.update { it.copy(messages = msgs) }
-            if (updated.persisted) toPersist = updated
+
+            when {
+                final && display.isNotBlank() && cur.dbId == null && !cur.persisted ->
+                    toPersist = updated
+                display.length > cur.text.length && cur.dbId != null ->
+                    toUpdate = updated.copy(dbId = cur.dbId, persisted = true)
+                else -> Unit
+            }
         }
         toPersist?.let { persist(it) }
+        toUpdate?.let { persistUpdate(it) }
     }
 
     private fun updateAssistant(responseId: String?, transform: (ChatMessage) -> ChatMessage) {
@@ -549,13 +771,87 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     private fun persist(msg: ChatMessage) {
         viewModelScope.launch(Dispatchers.IO) {
             persistMutex.withLock {
-                val id = conversationId ?: repo.createConversation(msg.text, msg.createdAt).also { newId ->
-                    conversationId = newId
-                    _state.update { it.copy(conversationId = newId, title = it.title ?: msg.text.take(60)) }
+                // Re-read latest text — a longer completed/concat may have landed while we queued.
+                val latest = _state.value.messages.firstOrNull { it.localId == msg.localId }
+                val textToSave = listOfNotNull(latest?.text, msg.text).maxBy { it.length }
+                if (textToSave.isBlank()) return@withLock
+                if (latest?.dbId != null) {
+                    if (textToSave.length > latest.text.length) {
+                        val convId = conversationId ?: return@withLock
+                        repo.updateMessageText(latest.dbId, convId, textToSave)
+                        _state.update { s ->
+                            s.copy(messages = s.messages.map {
+                                if (it.localId == msg.localId) it.copy(text = textToSave, persisted = true, final = true) else it
+                            })
+                        }
+                    }
+                    return@withLock
                 }
-                repo.addMessage(id, if (msg.role == Role.USER) "user" else "assistant", msg.text, msg.createdAt)
+                val id = conversationId ?: repo.createConversation(textToSave, msg.createdAt).also { newId ->
+                    conversationId = newId
+                    _state.update { it.copy(conversationId = newId, title = it.title ?: textToSave.take(60)) }
+                }
+                val rowId = repo.addMessage(
+                    id,
+                    if (msg.role == Role.USER) "user" else "assistant",
+                    textToSave,
+                    msg.createdAt,
+                )
+                _state.update { s ->
+                    s.copy(
+                        messages = s.messages.map {
+                            if (it.localId == msg.localId) {
+                                val best = if (it.text.length >= textToSave.length) it.text else textToSave
+                                it.copy(persisted = true, dbId = rowId, text = best, final = true)
+                            } else it
+                        },
+                    )
+                }
             }
         }
+    }
+
+    /** Rewrite Room text when a longer final / concatenated segment arrives after first persist. */
+    private fun persistUpdate(msg: ChatMessage) {
+        viewModelScope.launch(Dispatchers.IO) {
+            persistMutex.withLock {
+                val latest = _state.value.messages.firstOrNull { it.localId == msg.localId } ?: return@withLock
+                val rowId = latest.dbId ?: msg.dbId
+                val convId = conversationId
+                if (rowId == null || convId == null) return@withLock
+                val textToSave = listOf(latest.text, msg.text).maxBy { it.length }
+                repo.updateMessageText(rowId, convId, textToSave)
+                _state.update { s ->
+                    s.copy(
+                        messages = s.messages.map {
+                            if (it.localId == msg.localId && textToSave.length >= it.text.length) {
+                                it.copy(text = textToSave, dbId = rowId, persisted = true, final = true)
+                            } else it
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    /** Pull the final audio transcript from a response.done payload, if present. */
+    private fun extractAssistantTranscript(response: JSONObject?): String? {
+        if (response == null) return null
+        val output = response.optJSONArray("output") ?: return null
+        val parts = StringBuilder()
+        for (i in 0 until output.length()) {
+            val item = output.optJSONObject(i) ?: continue
+            val content = item.optJSONArray("content") ?: continue
+            for (j in 0 until content.length()) {
+                val c = content.optJSONObject(j) ?: continue
+                val t = c.optString("transcript").ifBlank { c.optString("text") }
+                if (t.isNotBlank()) {
+                    if (parts.isNotEmpty()) parts.append(' ')
+                    parts.append(t)
+                }
+            }
+        }
+        return parts.toString().ifBlank { null }
     }
 
     // ------------------------------------------------------------------ status helpers
@@ -595,11 +891,14 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     companion object {
         private const val TAG = "ChatViewModel"
         private const val PREF_BARGE_IN = "voice_barge_in"
+        private const val PREF_VOLUME = "playback_volume_percent"
+        private const val DEFAULT_VOLUME_PERCENT = 70
         /** 24 kHz PCM16 is the API default/recommended output format. */
         const val OUTPUT_RATE = 24_000
         private const val MAX_PREBUFFER_CHUNKS = 125 // ~5 s of 40 ms chunks
         private const val MAX_HISTORY_MESSAGES = 40
         private const val MAX_HISTORY_CHARS = 16_000
+        private val EMPTY_BYTES = ByteArray(0)
 
         val INSTRUCTIONS = """
             You are Grok, a witty, helpful assistant speaking with the user through their Pixel Watch.

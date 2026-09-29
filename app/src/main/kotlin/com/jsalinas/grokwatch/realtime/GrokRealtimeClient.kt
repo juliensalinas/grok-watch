@@ -10,6 +10,8 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -22,6 +24,9 @@ import java.util.concurrent.TimeUnit
  *  - server: `session.updated`, `input_audio_buffer.speech_started/stopped`,
  *    `conversation.item.input_audio_transcription.updated/completed`, `response.created`,
  *    `response.output_audio_transcript.delta/done`, `response.output_audio.delta`, `response.done`, `error`
+ *
+ * Audio deltas are Base64-decoded and handed to [Listener.onBinaryAudio] on a dedicated executor so
+ * the OkHttp reader thread never blocks on decode / player enqueue.
  */
 class GrokRealtimeClient(
     private val apiKey: String,
@@ -31,8 +36,13 @@ class GrokRealtimeClient(
     interface Listener {
         fun onOpen()
         fun onEvent(type: String, event: JSONObject)
-        /** Raw audio when the session uses `audio.output.transport = "binary"`. */
+        /** Raw PCM16 audio (binary transport, or decoded from JSON audio deltas). */
         fun onBinaryAudio(bytes: ByteArray)
+        /**
+         * Fired on the audio dispatch thread after any previously queued deltas for this response,
+         * so the player can stop accepting further PCM without clipping in-flight chunks.
+         */
+        fun onAssistantAudioEnd() {}
         fun onFailure(error: RealtimeError)
         fun onClosed(code: Int, reason: String)
     }
@@ -42,6 +52,11 @@ class GrokRealtimeClient(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
+
+    /** Serial decode/dispatch so player enqueue stays ordered without blocking OkHttp. */
+    private val audioDispatch: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "grok-ws-audio").apply { isDaemon = true }
+    }
 
     @Volatile private var ws: WebSocket? = null
     @Volatile private var closedByClient = false
@@ -59,11 +74,43 @@ class GrokRealtimeClient(
                 val event = try { JSONObject(text) } catch (e: Exception) {
                     Log.w(TAG, "Unparseable server event"); return
                 }
-                listener.onEvent(event.optString("type"), event)
+                val type = event.optString("type")
+                // Fast-path audio: copy the b64 string and return; decode off this thread.
+                if (type == "response.output_audio.delta" || type == "response.audio.delta") {
+                    val b64 = event.optString("delta")
+                    if (b64.isNotEmpty()) {
+                        audioDispatch.execute {
+                            if (closedByClient) return@execute
+                            val pcm = try {
+                                Base64.decode(b64, Base64.DEFAULT)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Bad audio delta base64", e)
+                                return@execute
+                            }
+                            if (pcm.size >= 2) listener.onBinaryAudio(pcm)
+                        }
+                    }
+                    // Still surface the event (without forcing the listener to decode again).
+                    listener.onEvent(type, event)
+                    return
+                }
+                if (type == "response.done") {
+                    // Queue after any prior audio tasks so in-flight deltas still enqueue.
+                    audioDispatch.execute {
+                        if (!closedByClient) listener.onAssistantAudioEnd()
+                    }
+                }
+                listener.onEvent(type, event)
             }
 
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) =
-                listener.onBinaryAudio(bytes.toByteArray())
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                // Copy off the OkHttp buffer immediately; hand to audio dispatcher.
+                val copy = bytes.toByteArray()
+                if (copy.isEmpty()) return
+                audioDispatch.execute {
+                    if (!closedByClient) listener.onBinaryAudio(copy)
+                }
+            }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
@@ -160,6 +207,7 @@ class GrokRealtimeClient(
         closedByClient = true
         ws?.close(1000, "client closed")
         ws = null
+        audioDispatch.shutdown()
     }
 
     companion object {
