@@ -32,11 +32,11 @@ https://docs.x.ai/developers/model-capabilities/audio/text-to-speech (voice list
 ### Echo and barge-in
 The mic uses the `VOICE_COMMUNICATION` source, with `AcousticEchoCanceler`, `NoiseSuppressor`, and AGC turned on where the watch supports them. The session stays in `MODE_IN_COMMUNICATION` for AEC, but playback uses `USAGE_ASSISTANT` + `CONTENT_TYPE_SPEECH` on a large `MODE_STREAM` AudioTrack (prefer 48 kHz with explicit linear upsample from the API's 24 kHz PCM) so the watch speaker is not forced through the tinny telephony/SCO EQ.
 By default the app is **half-duplex**: while Grok is talking it sends silence instead of the mic signal, so the watch
-speaker can't trigger the server's voice detection. Tap **Stop** (the edge button) to interrupt. That calls `response.cancel`,
+speaker can't trigger the server's voice detection. Tap **Stop** (pinned at the top of the screen while Grok speaks) to interrupt. That calls `response.cancel`,
 clears local playback, and sends `conversation.item.truncate` so Grok's context matches what you actually heard.
-**Mute**, directly above Stop while Grok is speaking, pauses only the current spoken reply (AudioTrack playback). Captions keep
+**Mute**, directly above Stop at the top while Grok is speaking, pauses only the current spoken reply (AudioTrack playback). Captions keep
 updating. Tap again to hear the rest of that same reply. The next assistant turn always starts unmuted. Mute is not saved
-across responses or restarts.
+across responses or restarts. The bottom edge button stays **History** (or **Retry** on a recoverable error).
 Turn on **Voice interrupt** in the list to talk over Grok instead. This relies on the watch's echo cancellation.
 
 ### Volume

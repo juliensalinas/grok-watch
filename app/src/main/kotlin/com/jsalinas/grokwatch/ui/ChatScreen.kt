@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -109,6 +110,7 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
     val bubbleParts = messages.flatMap { it.toBubbleParts() }
     // StatusHeader + VolumeControls precede the message items.
     val firstMessageIndex = 2
+    val speaking = state.status == SessionStatus.SPEAKING
 
     // Auto-scroll to the newest text as it streams in (unless the user is scrolling).
     val lastText = messages.lastOrNull()?.text?.length ?: 0
@@ -125,52 +127,33 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
         }
     }
 
-    ScreenScaffold(
-        scrollState = listState,
-        edgeButton = {
-            val speaking = state.status == SessionStatus.SPEAKING
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                // Above Stop: silences only this spoken reply. Hidden once the turn ends.
-                if (speaking) {
-                    FilledTonalButton(
-                        onClick = vm::toggleResponseMute,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp),
-                        label = { Text(if (state.responseMuted) "Muted" else "Mute") },
-                    )
-                    Spacer(Modifier.height(4.dp))
-                }
+    Box(Modifier.fillMaxSize()) {
+        ScreenScaffold(
+            scrollState = listState,
+            edgeButton = {
+                // Stop/Mute are pinned at the top while speaking; bottom edge keeps History / Retry.
                 when {
-                    speaking ->
-                        EdgeButton(onClick = vm::interrupt, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
                     state.error != null && state.errorRetryable && micGranted ->
                         EdgeButton(onClick = vm::retry, buttonSize = EdgeButtonSize.Small) { Text("Retry") }
                     else ->
                         EdgeButton(onClick = onOpenHistory, buttonSize = EdgeButtonSize.Small) { Text("History") }
                 }
-            }
-        },
-    ) { contentPadding ->
-        ScalingLazyColumn(
-            state = listState,
-            contentPadding = contentPadding,
-            anchorType = ScalingLazyListAnchorType.ItemStart,
-            // Default snap-fling + edge scaling clips tall bubbles mid-item; use free fling
-            // and flat scaling so long transcripts stay fully scrollable/readable.
-            flingBehavior = ScrollableDefaults.flingBehavior(),
-            scalingParams = ScalingLazyColumnDefaults.scalingParams(edgeScale = 1f, edgeAlpha = 1f),
-            autoCentering = null,
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            item { StatusHeader(state, micGranted) }
-            item { VolumeControls(percent = state.volumePercent, onAdjust = vm::adjustVolume) }
+            },
+        ) { contentPadding ->
+            ScalingLazyColumn(
+                state = listState,
+                contentPadding = contentPadding,
+                anchorType = ScalingLazyListAnchorType.ItemStart,
+                // Default snap-fling + edge scaling clips tall bubbles mid-item; use free fling
+                // and flat scaling so long transcripts stay fully scrollable/readable.
+                flingBehavior = ScrollableDefaults.flingBehavior(),
+                scalingParams = ScalingLazyColumnDefaults.scalingParams(edgeScale = 1f, edgeAlpha = 1f),
+                autoCentering = null,
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                item { StatusHeader(state, micGranted) }
+                item { VolumeControls(percent = state.volumePercent, onAdjust = vm::adjustVolume) }
 
             items(bubbleParts, key = { "${it.messageLocalId}-${it.partIndex}" }) { part ->
                 MessageBubble(part)
@@ -223,6 +206,30 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Voice interrupt") },
                     secondaryLabel = { Text(if (state.voiceBargeIn) "Talk over Grok" else "Tap Stop instead") },
+                )
+            }
+        }
+        }
+
+        // Pinned to the top of the round screen while Grok speaks (Mute above Stop).
+        if (speaking) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .padding(top = 10.dp, start = 14.dp, end = 14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                FilledTonalButton(
+                    onClick = vm::toggleResponseMute,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(if (state.responseMuted) "Muted" else "Mute") },
+                )
+                Spacer(Modifier.height(4.dp))
+                Button(
+                    onClick = vm::interrupt,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Stop") },
                 )
             }
         }
