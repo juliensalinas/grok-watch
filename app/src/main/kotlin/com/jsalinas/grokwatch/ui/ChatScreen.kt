@@ -128,13 +128,32 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
     ScreenScaffold(
         scrollState = listState,
         edgeButton = {
-            when {
-                state.status == SessionStatus.SPEAKING ->
-                    EdgeButton(onClick = vm::interrupt, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
-                state.error != null && state.errorRetryable && micGranted ->
-                    EdgeButton(onClick = vm::retry, buttonSize = EdgeButtonSize.Small) { Text("Retry") }
-                else ->
-                    EdgeButton(onClick = onOpenHistory, buttonSize = EdgeButtonSize.Small) { Text("History") }
+            val speaking = state.status == SessionStatus.SPEAKING
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                // Above Stop: silences only this spoken reply. Hidden once the turn ends.
+                if (speaking) {
+                    FilledTonalButton(
+                        onClick = vm::toggleResponseMute,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
+                        label = { Text(if (state.responseMuted) "Muted" else "Mute") },
+                    )
+                    Spacer(Modifier.height(4.dp))
+                }
+                when {
+                    speaking ->
+                        EdgeButton(onClick = vm::interrupt, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
+                    state.error != null && state.errorRetryable && micGranted ->
+                        EdgeButton(onClick = vm::retry, buttonSize = EdgeButtonSize.Small) { Text("Retry") }
+                    else ->
+                        EdgeButton(onClick = onOpenHistory, buttonSize = EdgeButtonSize.Small) { Text("History") }
+                }
             }
         },
     ) { contentPadding ->

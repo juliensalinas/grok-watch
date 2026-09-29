@@ -57,6 +57,11 @@ data class ChatUiState(
     val voiceBargeIn: Boolean = false,
     /** Preferred playback volume 0–100 for STREAM_MUSIC (ASSISTANT AudioTrack). */
     val volumePercent: Int = 70,
+    /**
+     * True only while the current assistant reply's playback is silenced.
+     * Not persisted. Cleared when the next assistant turn starts.
+     */
+    val responseMuted: Boolean = false,
     val apiKeyMissing: Boolean = BuildConfig.XAI_API_KEY.isBlank(),
 )
 
@@ -150,7 +155,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             started = true
         }
         val gen = ++sessionGen
-        _state.update { it.copy(error = null, notice = null) }
+        _state.update { it.copy(error = null, notice = null, responseMuted = false) }
 
         if (BuildConfig.XAI_API_KEY.isBlank()) {
             fail("API key missing. Rebuild the app with XAI_API_KEY set.", retryable = false)
@@ -228,7 +233,10 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         sessionGen++
         teardown()
         persistPartials()
-        _state.update { if (it.status != SessionStatus.ERROR) it.copy(status = SessionStatus.IDLE) else it }
+        _state.update {
+            val next = if (it.status != SessionStatus.ERROR) it.copy(status = SessionStatus.IDLE) else it
+            next.copy(responseMuted = false)
+        }
     }
 
     fun retry() {
@@ -277,7 +285,19 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     /** Tap-to-interrupt: stop Grok talking and go back to listening. */
     fun interrupt() {
         synchronized(lock) { interruptLocked(cancelServer = true) }
-        _state.update { it.copy(status = SessionStatus.LISTENING) }
+        _state.update { it.copy(status = SessionStatus.LISTENING, responseMuted = false) }
+    }
+
+    /**
+     * Silence only the in-flight spoken reply. Captions keep streaming.
+     * Tap again to resume this reply. The next assistant turn always starts unmuted.
+     */
+    fun toggleResponseMute() {
+        val mute = !_state.value.responseMuted
+        val p = player
+        if (p == null) return
+        p.setPlaybackMuted(mute)
+        _state.update { it.copy(responseMuted = mute) }
     }
 
     private fun interruptLocked(cancelServer: Boolean) {
@@ -287,6 +307,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         val playedMs = if (start != null) ((p.playedFrames() - start).coerceAtLeast(0) * 1000 / OUTPUT_RATE) else 0
         acceptAssistantAudio = false
         p.flush() // barge-in / Stop only — never on half-duplex mic silence
+        p.setPlaybackMuted(false)
         responseAudioStartFrame = null
         if (responseActive && cancelServer) c?.cancelResponse()
         // Tell the server how much the user actually heard so the context matches reality.
@@ -310,7 +331,9 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         // Half-duplex echo guard: unless voice barge-in is enabled, send silence while Grok is audible
         // so the watch speaker never triggers the server VAD. Do NOT flush AudioTrack here — that
         // would create audible gaps. (AEC is still on in both modes.)
-        val gated = !_state.value.voiceBargeIn && p != null && p.isAudible()
+        // Stay gated while this reply is muted so ambient noise doesn't cancel it; captions continue.
+        val s = _state.value
+        val gated = !s.voiceBargeIn && p != null && (p.isAudible() || (s.responseMuted && responseActive))
         if (gated) {
             if (silenceBuf.size != chunk.size) silenceBuf = ByteArray(chunk.size)
             c.appendAudio(silenceBuf)
@@ -448,10 +471,13 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                     currentAssistantItemId = null
                     responseAudioStartFrame = null
                     appendMessage(newMessage(Role.ASSISTANT, "", null, rid))
+                    // New assistant turn always starts with audio. Mute never carries over.
+                    player?.setPlaybackMuted(false)
                 }
                 sealPersist?.let { sealed ->
                     if (sealed.dbId != null) persistUpdate(sealed) else persist(sealed)
                 }
+                _state.update { if (it.responseMuted) it.copy(responseMuted = false) else it }
                 setStatus(SessionStatus.THINKING)
             }
 

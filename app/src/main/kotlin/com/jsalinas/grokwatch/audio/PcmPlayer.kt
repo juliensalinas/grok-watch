@@ -43,6 +43,10 @@ class PcmPlayer(
     @Volatile private var lastAudibleAt = 0L
     @Volatile private var lastEnqueueAt = 0L
     @Volatile private var headBase = 0L
+    /** Source-rate frames heard before the current [headBase] (survives a per-reply mute). */
+    private val playedBase = AtomicLong(0)
+    /** When true, drop PCM and keep the track paused. Not sticky across [setPlaybackMuted](false). */
+    @Volatile private var playbackMuted = false
     private var track: AudioTrack? = null
     private var thread: Thread? = null
 
@@ -85,6 +89,7 @@ class PcmPlayer(
                     )
                     continue
                 }
+                if (playbackMuted) continue
                 val chunk = polled
                 val gen = generation.get()
                 // Resample on the writer thread so enqueue()/WS callbacks stay cheap.
@@ -106,7 +111,7 @@ class PcmPlayer(
                     }
                     off += n
                     playBytesBuffered += n
-                    if (gen == generation.get()) {
+                    if (gen == generation.get() && !playbackMuted) {
                         val playFrames = n / 2
                         val sourceFrames = playFrames.toLong() * sourceSampleRate / playSampleRate
                         framesWritten.addAndGet(sourceFrames)
@@ -140,7 +145,7 @@ class PcmPlayer(
         prebufferPlayBytes: Int,
         force: Boolean,
     ) {
-        if (playStarted || playBytesBuffered < 2) return
+        if (playbackMuted || playStarted || playBytesBuffered < 2) return
         if (!force && playBytesBuffered < prebufferPlayBytes) return
         runCatching {
             if (opened.playState != AudioTrack.PLAYSTATE_PLAYING) {
@@ -237,7 +242,7 @@ class PcmPlayer(
      * Resampling and AudioTrack I/O happen on the writer thread.
      */
     fun enqueue(pcm: ByteArray) {
-        if (!running || pcm.isEmpty()) return
+        if (!running || pcm.isEmpty() || playbackMuted) return
         val toPlay = synchronized(coalesceLock) {
             val sourceAligned = alignAndBuffer(pcm) ?: return
             framesEnqueued.addAndGet((sourceAligned.size / 2).toLong())
@@ -308,12 +313,13 @@ class PcmPlayer(
 
     /** Frames that have actually been played out since the last flush (source-rate units). */
     fun playedFrames(): Long {
-        val playFrames = rawHead() - headBase
-        return if (playSampleRate == sourceSampleRate) {
+        val playFrames = (rawHead() - headBase).coerceAtLeast(0)
+        val source = if (playSampleRate == sourceSampleRate) {
             playFrames
         } else {
             playFrames * sourceSampleRate / playSampleRate
         }
+        return playedBase.get() + source
     }
 
     private fun rawHead(): Long =
@@ -326,6 +332,7 @@ class PcmPlayer(
 
     /** True while queued or buffered audio is still being played (plus a short tail). */
     fun isAudible(tailMs: Long = 400): Boolean {
+        if (playbackMuted) return false
         if (!playStarted && (queue.isNotEmpty() || framesEnqueued.get() > 0)) return true
         if (queue.isNotEmpty()) return true
         synchronized(coalesceLock) { if (coalesce.size() >= 2) return true }
@@ -347,8 +354,41 @@ class PcmPlayer(
         }
         playStarted = false
         headBase = rawHead()
+        playedBase.set(0)
         framesWritten.set(0)
         framesEnqueued.set(0)
+        lastAudibleAt = 0L
+        lastEnqueueAt = 0L
+    }
+
+    /**
+     * Silence the current reply only. Pauses and drops buffered PCM so playback stops immediately,
+     * but does not tear down the track. [enqueue] drops further chunks until [setPlaybackMuted]
+     * is called with false (the next assistant turn, or an unmute of this reply).
+     */
+    fun setPlaybackMuted(muted: Boolean) {
+        if (playbackMuted == muted) return
+        playbackMuted = muted
+        if (muted) silenceBufferedAudio()
+    }
+
+    fun isPlaybackMuted(): Boolean = playbackMuted
+
+    /** Drop queued/buffered audio without resetting the session timeline (mute, not barge-in). */
+    private fun silenceBufferedAudio() {
+        generation.incrementAndGet()
+        queue.clear()
+        synchronized(coalesceLock) {
+            pendingOdd = null
+            coalesce.reset()
+        }
+        val heard = playedFrames()
+        track?.let { runCatching { it.pause(); it.flush() } }
+        playStarted = false
+        headBase = rawHead()
+        playedBase.set(heard)
+        framesWritten.set(heard)
+        framesEnqueued.set(heard)
         lastAudibleAt = 0L
         lastEnqueueAt = 0L
     }

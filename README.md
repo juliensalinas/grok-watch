@@ -17,7 +17,7 @@ voice conversation with Grok through the xAI **Grok Voice Agent (speech-to-speec
 | Endpoint | `wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-2.0` |
 | Auth | `Authorization: Bearer <XAI_API_KEY>` header on the WebSocket upgrade |
 | Model | `grok-voice-think-fast-2.0`: the docs call it the "Flagship voice model"; `grok-voice-latest` is an alias for it. It's pinned here, as the docs recommend for production. Override with `-PgrokModel=grok-voice-latest`. |
-| Voice | `rex` (male: confident, clear, professional — xAI built-in). Override with `-PgrokVoice=ara` / `eve` / `leo` / … |
+| Voice | `sal` (neutral: smooth, balanced — xAI built-in). Override with `-PgrokVoice=rex` / `ara` / `eve` / `leo` / … |
 | Turn-taking | `turn_detection: server_vad` (the server detects the end of speech and starts the reply) |
 | Audio in | `audio/pcm` PCM16 LE mono, 16 kHz (falls back to 24/48 kHz if the mic can't do 16 kHz), base64 in `input_audio_buffer.append` |
 | Audio out | `audio/pcm` PCM16 LE mono, 24 kHz (API default/recommended) from `response.output_audio.delta` |
@@ -34,6 +34,9 @@ The mic uses the `VOICE_COMMUNICATION` source, with `AcousticEchoCanceler`, `Noi
 By default the app is **half-duplex**: while Grok is talking it sends silence instead of the mic signal, so the watch
 speaker can't trigger the server's voice detection. Tap **Stop** (the edge button) to interrupt. That calls `response.cancel`,
 clears local playback, and sends `conversation.item.truncate` so Grok's context matches what you actually heard.
+**Mute**, directly above Stop while Grok is speaking, pauses only the current spoken reply (AudioTrack playback). Captions keep
+updating. Tap again to hear the rest of that same reply. The next assistant turn always starts unmuted. Mute is not saved
+across responses or restarts.
 Turn on **Voice interrupt** in the list to talk over Grok instead. This relies on the watch's echo cancellation.
 
 ### Volume
