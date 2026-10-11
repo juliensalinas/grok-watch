@@ -20,6 +20,8 @@ class MicRecorder(
     private val chunkMs: Int = 40,
 ) {
     @Volatile private var running = false
+    /** Identity of the current capture run; an old thread exits as soon as this changes (safe restart). */
+    @Volatile private var runToken: Any? = null
     private var thread: Thread? = null
     private var record: AudioRecord? = null
     private val effects = mutableListOf<android.media.audiofx.AudioEffect>()
@@ -46,21 +48,24 @@ class MicRecorder(
             return false
         }
         running = true
+        val token = Any()
+        runToken = token
         val bytesPerChunk = sampleRate * 2 * chunkMs / 1000
         thread = Thread({
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-            while (running) {
+            while (runToken === token) {
                 val buf = ByteArray(bytesPerChunk)
                 var off = 0
-                while (running && off < bytesPerChunk) {
+                var readError = false
+                while (runToken === token && off < bytesPerChunk) {
                     val n = rec.read(buf, off, bytesPerChunk - off)
                     if (n <= 0) {
-                        if (n < 0) Log.w(TAG, "AudioRecord.read error $n")
+                        if (n < 0) { Log.w(TAG, "AudioRecord.read error $n"); readError = true }
                         break
                     }
                     off += n
                 }
-                if (!running) break
+                if (runToken !== token || readError) break
                 // PCM16 must be 2-byte aligned; drop a trailing odd byte rather than send a torn sample.
                 val even = off and 1.inv()
                 if (even > 0) onChunk(if (even == bytesPerChunk) buf else buf.copyOf(even))
@@ -106,8 +111,11 @@ class MicRecorder(
         }
     }
 
+    val isRunning: Boolean get() = running
+
     fun stop() {
         running = false
+        runToken = null
         runCatching { record?.stop() }
         thread?.join(500)
         thread = null

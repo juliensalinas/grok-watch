@@ -31,7 +31,11 @@ import java.util.concurrent.atomic.AtomicLong
 
 enum class Role { USER, ASSISTANT }
 
-enum class SessionStatus { IDLE, CONNECTING, LISTENING, HEARING, THINKING, SPEAKING, ERROR }
+/**
+ * [AWAITING] = session alive but the mic is closed: Grok finished (or was stopped) and the app waits
+ * for Talk / double-pinch. [IDLE] = no session at all (screen left / stopped).
+ */
+enum class SessionStatus { IDLE, CONNECTING, LISTENING, HEARING, THINKING, SPEAKING, AWAITING, ERROR }
 
 data class ChatMessage(
     val localId: Long,
@@ -89,11 +93,17 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
 
     @Volatile private var conversationId: Long? = initialConversationId.takeIf { it > 0 }
     private var historyJob: Job? = null
-    private var history: List<Pair<Role, String>> = emptyList()
 
     // --- per-session state (guarded by [lock]) ---
     @Volatile private var started = false
     @Volatile private var sessionGen = 0
+    /** Bumped for every WebSocket (re)connect so events from a dropped socket are ignored. */
+    @Volatile private var connGen = 0
+    /** True while the user is allowed to speak (mic captured and streamed). */
+    @Volatile private var micOpen = false
+    private val micLock = Any()
+    private var listenTimeoutJob: Job? = null
+    private var thinkingSince = 0L
     private var client: GrokRealtimeClient? = null
     private var mic: MicRecorder? = null
     private var player: PcmPlayer? = null
@@ -126,7 +136,6 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             historyJob = viewModelScope.launch(Dispatchers.IO) {
                 val conv = repo.getConversation(id)
                 val msgs = repo.getMessages(id)
-                history = msgs.map { (if (it.role == "user") Role.USER else Role.ASSISTANT) to it.text }
                 _state.update { s ->
                     s.copy(
                         conversationId = id,
@@ -199,28 +208,147 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             itemSegmentText.clear()
             silenceBuf = EMPTY_BYTES
         }
-        // Start capturing immediately (buffered until the socket is ready) to minimise latency.
-        if (!m.start { chunk -> onMicChunk(gen, chunk) }) {
+        // Auto-listen on open: start capturing immediately (buffered until the socket is ready).
+        if (!openMic(gen)) {
             fail("Microphone unavailable. Close other apps using it and retry.", retryable = true)
             return
         }
+        armListenTimeout(gen)
 
         viewModelScope.launch {
             historyJob?.join()
             if (gen != sessionGen || !started) return@launch
-            val c = GrokRealtimeClient(BuildConfig.XAI_API_KEY, BuildConfig.GROK_MODEL, listenerFor(gen))
-            synchronized(lock) { client = c }
-            c.connect()
+            openConnection(gen)
         }
         tickerJob = viewModelScope.launch {
             while (isActive) {
                 delay(200)
                 val pl = player ?: continue
                 val s = _state.value.status
+                // Grok finished talking (response done + playback drained) -> stop listening.
                 if (s == SessionStatus.SPEAKING && !responseActive && !pl.isAudible()) {
-                    _state.update { if (it.status == SessionStatus.SPEAKING) it.copy(status = SessionStatus.LISTENING) else it }
+                    finishTurn(gen)
+                }
+                // VAD ended a segment but no response came (noise / empty speech): let the user go on.
+                if (s == SessionStatus.THINKING && !responseActive) {
+                    val now = System.currentTimeMillis()
+                    if (thinkingSince == 0L) thinkingSince = now
+                    if (now - thinkingSince > NO_RESPONSE_MS) {
+                        thinkingSince = 0L
+                        if (micOpen) {
+                            _state.update { if (it.status == SessionStatus.THINKING) it.copy(status = SessionStatus.LISTENING) else it }
+                            armListenTimeout(gen)
+                        } else {
+                            finishTurn(gen)
+                        }
+                    }
+                } else {
+                    thinkingSince = 0L
                 }
             }
+        }
+    }
+
+    /** (Re)open the WebSocket. Prior turns are replayed as text so context survives a reconnect. */
+    private fun openConnection(gen: Int) {
+        if (gen != sessionGen || !started) return
+        val cg = ++connGen
+        val c = GrokRealtimeClient(BuildConfig.XAI_API_KEY, BuildConfig.GROK_MODEL, listenerFor(gen, cg))
+        val old = synchronized(lock) {
+            val o = client
+            client = c
+            wsReady = false
+            sessionConfirmed = false
+            o
+        }
+        old?.close()
+        c.connect()
+    }
+
+    /** Socket dropped while idle (e.g. server idle timeout): forget it; Talk reconnects on demand. */
+    private fun dropIdleConnection() {
+        val old = synchronized(lock) {
+            val o = client
+            client = null
+            wsReady = false
+            preBuffer.clear()
+            o
+        }
+        connGen++
+        old?.close()
+    }
+
+    private fun isIdleAwaiting(): Boolean =
+        !micOpen && !responseActive && _state.value.status == SessionStatus.AWAITING
+
+    // ------------------------------------------------------------------ mic turn control
+
+    private fun openMic(gen: Int): Boolean = synchronized(micLock) {
+        val m = mic ?: return false
+        micOpen = true
+        if (m.isRunning) return true
+        val ok = m.start { chunk -> onMicChunk(gen, chunk) }
+        if (!ok) micOpen = false
+        ok
+    }
+
+    /** Fully stop capture so nothing reaches the server VAD (and the mic indicator turns off). */
+    private fun closeMic() {
+        listenTimeoutJob?.cancel(); listenTimeoutJob = null
+        synchronized(micLock) {
+            micOpen = false
+            mic?.stop()
+        }
+    }
+
+    private fun armListenTimeout(gen: Int) {
+        listenTimeoutJob?.cancel()
+        listenTimeoutJob = viewModelScope.launch {
+            delay(LISTEN_TIMEOUT_MS)
+            if (gen != sessionGen || !started) return@launch
+            val st = _state.value.status
+            val noTurn = synchronized(lock) { openUserLocalId == null }
+            if ((st == SessionStatus.LISTENING || st == SessionStatus.CONNECTING) && noTurn && !responseActive) {
+                // Nobody spoke: stop listening and wait for Talk.
+                closeMic()
+                _state.update { it.copy(status = SessionStatus.AWAITING) }
+            }
+        }
+    }
+
+    /** Grok's reply is over (or was stopped): close the mic and wait for Talk / double-pinch. */
+    private fun finishTurn(gen: Int) {
+        if (gen != sessionGen || !started) return
+        // Voice barge-in may have started a new user turn on top of the reply — keep listening then.
+        val userTalking = synchronized(lock) { openUserLocalId != null }
+        if (userTalking) return
+        closeMic()
+        _state.update {
+            if (it.status == SessionStatus.SPEAKING || it.status == SessionStatus.THINKING)
+                it.copy(status = SessionStatus.AWAITING, responseMuted = false) else it
+        }
+    }
+
+    /** Talk button / double-pinch while idle: open the mic for the next question. */
+    fun startListening() {
+        if (!started) {
+            // Session was torn down (e.g. error); behave like Retry.
+            if (_state.value.status == SessionStatus.ERROR || _state.value.status == SessionStatus.IDLE) retry()
+            return
+        }
+        val st = _state.value.status
+        if (st != SessionStatus.AWAITING) return
+        val gen = sessionGen
+        _state.update { it.copy(status = SessionStatus.LISTENING, notice = null, responseMuted = false) }
+        if (!openMic(gen)) {
+            fail("Microphone unavailable. Close other apps using it and retry.", retryable = true)
+            return
+        }
+        armListenTimeout(gen)
+        if (synchronized(lock) { client == null }) {
+            // Idle socket was closed by the server: reconnect transparently. Mic audio is
+            // pre-buffered until the new session is ready, so the user can start talking now.
+            openConnection(gen)
         }
     }
 
@@ -247,6 +375,8 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
 
     private fun teardown() {
         tickerJob?.cancel(); tickerJob = null
+        listenTimeoutJob?.cancel(); listenTimeoutJob = null
+        micOpen = false
         val (c, m, p) = synchronized(lock) {
             val t = Triple(client, mic, player)
             client = null; mic = null; player = null; wsReady = false; preBuffer.clear()
@@ -254,7 +384,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             acceptAssistantAudio = false
             t
         }
-        m?.stop()
+        synchronized(micLock) { m?.stop() }
         c?.close()
         p?.stop()
         routing.end()
@@ -282,10 +412,11 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         _state.update { it.copy(volumePercent = pct) }
     }
 
-    /** Tap-to-interrupt: stop Grok talking and go back to listening. */
+    /** Stop button / double-pinch while speaking: cut Grok off and go idle (not listening). */
     fun interrupt() {
         synchronized(lock) { interruptLocked(cancelServer = true) }
-        _state.update { it.copy(status = SessionStatus.LISTENING, responseMuted = false) }
+        closeMic()
+        _state.update { it.copy(status = SessionStatus.AWAITING, responseMuted = false) }
     }
 
     /**
@@ -317,7 +448,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     // ------------------------------------------------------------------ audio
 
     private fun onMicChunk(gen: Int, chunk: ByteArray) {
-        if (gen != sessionGen) return
+        if (gen != sessionGen || !micOpen) return
         val c: GrokRealtimeClient
         synchronized(lock) {
             if (!wsReady) {
@@ -357,13 +488,18 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
 
     // ------------------------------------------------------------------ realtime events
 
-    private fun listenerFor(gen: Int) = object : GrokRealtimeClient.Listener {
+    private fun listenerFor(gen: Int, cg: Int) = object : GrokRealtimeClient.Listener {
+        private fun live() = gen == sessionGen && cg == connGen
+
         override fun onOpen() {
-            if (gen != sessionGen) return
+            if (!live()) return
             val c = client ?: return
             val m = mic ?: return
             c.sessionUpdate(BuildConfig.GROK_VOICE, INSTRUCTIONS, m.sampleRate, OUTPUT_RATE, liveTranscription)
-            // Resume: replay prior turns as text context (bounded).
+            // Resume / reconnect: replay prior turns as text context (bounded).
+            val history = _state.value.messages
+                .filter { it.final && it.text.isNotBlank() }
+                .map { it.role to it.text }
             var budget = MAX_HISTORY_CHARS
             val seed = history.asReversed().takeWhile { budget -= it.second.length; budget > 0 }
                 .take(MAX_HISTORY_MESSAGES).asReversed()
@@ -375,7 +511,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         }
 
         override fun onEvent(type: String, event: JSONObject) {
-            if (gen != sessionGen) return
+            if (!live()) return
             try {
                 handleEvent(type, event)
             } catch (e: Exception) {
@@ -384,24 +520,30 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         }
 
         override fun onBinaryAudio(bytes: ByteArray) {
-            if (gen == sessionGen) onAssistantAudio(bytes)
+            if (live()) onAssistantAudio(bytes)
         }
 
         override fun onAssistantAudioEnd() {
-            if (gen != sessionGen) return
+            if (!live()) return
             // Only clear if no newer response has already started (responseActive true again).
             if (!responseActive) acceptAssistantAudio = false
         }
 
         override fun onFailure(error: RealtimeError) {
-            if (gen != sessionGen) return
-            viewModelScope.launch { failAndStop(error.message, error.retryable) }
+            if (!live()) return
+            viewModelScope.launch {
+                if (!live()) return@launch
+                if (isIdleAwaiting() && error.retryable) dropIdleConnection()
+                else failAndStop(error.message, error.retryable)
+            }
         }
 
         override fun onClosed(code: Int, reason: String) {
-            if (gen != sessionGen) return
+            if (!live()) return
             viewModelScope.launch {
-                failAndStop("Disconnected ($code${if (reason.isNotBlank()) ": $reason" else ""}).", true)
+                if (!live()) return@launch
+                if (isIdleAwaiting()) dropIdleConnection()
+                else failAndStop("Disconnected ($code${if (reason.isNotBlank()) ": $reason" else ""}).", true)
             }
         }
     }
@@ -444,6 +586,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                         }
                     }
                 }
+                listenTimeoutJob?.cancel()
                 setStatus(SessionStatus.HEARING)
             }
 
@@ -478,6 +621,9 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                     if (sealed.dbId != null) persistUpdate(sealed) else persist(sealed)
                 }
                 _state.update { if (it.responseMuted) it.copy(responseMuted = false) else it }
+                // The question is in. Without voice barge-in nothing more should reach the server
+                // VAD this turn, so stop the mic now (it reopens on Talk / double-pinch).
+                if (!_state.value.voiceBargeIn) closeMic()
                 setStatus(SessionStatus.THINKING)
             }
 
@@ -525,10 +671,14 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                     it.copy(text = t, final = true)
                 }
                 finalizeAssistant(rid)
-                if (player?.isAudible() != true) {
-                    _state.update {
-                        if (it.status == SessionStatus.SPEAKING || it.status == SessionStatus.THINKING)
-                            it.copy(status = SessionStatus.LISTENING) else it
+                // Reply with no (remaining) audio: go idle once any in-flight PCM had a chance to land.
+                // If audio does start playing, status flips to SPEAKING and the ticker finishes the turn
+                // when playback drains.
+                val g = sessionGen
+                viewModelScope.launch {
+                    delay(400)
+                    if (_state.value.status == SessionStatus.THINKING && !responseActive && player?.isAudible() != true) {
+                        finishTurn(g)
                     }
                 }
             }
@@ -554,7 +704,11 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                         }
                     }
                     code == "timeout" || code == "max_duration" ->
-                        viewModelScope.launch { failAndStop("Session ended ($code). Tap Retry to continue.", true) }
+                        viewModelScope.launch {
+                            // Idle: reconnect silently on the next Talk. Mid-turn: surface it.
+                            if (isIdleAwaiting()) dropIdleConnection()
+                            else failAndStop("Session ended ($code). Tap Retry to continue.", true)
+                        }
                     else -> showNotice(msg.ifBlank { "Server error: $code" })
                 }
             }
@@ -922,6 +1076,10 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         /** 24 kHz PCM16 is the API default/recommended output format. */
         const val OUTPUT_RATE = 24_000
         private const val MAX_PREBUFFER_CHUNKS = 125 // ~5 s of 40 ms chunks
+        /** Close the mic if nobody starts speaking within this window after Talk / open. */
+        private const val LISTEN_TIMEOUT_MS = 30_000L
+        /** VAD ended a segment but no response.created followed. */
+        private const val NO_RESPONSE_MS = 6_000L
         private const val MAX_HISTORY_MESSAGES = 40
         private const val MAX_HISTORY_CHARS = 16_000
         private val EMPTY_BYTES = ByteArray(0)

@@ -105,8 +105,9 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
         onStopOrDispose { vm.stop() }
     }
 
-    // --- keep the screen on during a live session ---
-    val sessionLive = state.status != SessionStatus.IDLE && state.status != SessionStatus.ERROR
+    // --- keep the screen on while listening / thinking / speaking (not while waiting for Talk) ---
+    val sessionLive = state.status != SessionStatus.IDLE && state.status != SessionStatus.ERROR &&
+        state.status != SessionStatus.AWAITING
     val activity = context.findActivity()
     DisposableEffect(sessionLive, activity) {
         if (sessionLive) activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -119,6 +120,8 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
     // StatusHeader + VolumeControls precede the message items.
     val firstMessageIndex = 2
     val speaking = state.status == SessionStatus.SPEAKING
+    // Waiting for the next question: mic closed, Talk / double-pinch opens it.
+    val awaiting = state.status == SessionStatus.AWAITING && micGranted
 
     // Auto-scroll to the newest text as it streams in (unless the user is scrolling).
     val lastText = messages.lastOrNull()?.text?.length ?: 0
@@ -137,22 +140,27 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
 
     // Primary one-handed gesture: on Pixel Watch this is double-pinch (Wear OS 7).
     // The library no-ops on hardware that does not support the gesture framework.
-    val stopGesture = rememberOneHandedGestureConfiguration(
+    // Same gesture, state-dependent action: stop Grok while it speaks, start listening while idle.
+    val pinchGesture = rememberOneHandedGestureConfiguration(
         action = OneHandedGestureAction.Primary,
-        gestureId = "grok-stop-speaking",
+        gestureId = "grok-pinch",
         priority = OneHandedGesturePriority.Clickable,
     )
     val screenModifier = Modifier
         .fillMaxSize()
         .then(
-            if (speaking) {
-                Modifier.oneHandedGesture(
-                    gestureConfiguration = stopGesture,
+            when {
+                speaking -> Modifier.oneHandedGesture(
+                    gestureConfiguration = pinchGesture,
                     onGestureLabel = "Stop Grok",
                     onGesture = { vm.interrupt() },
                 )
-            } else {
-                Modifier
+                awaiting -> Modifier.oneHandedGesture(
+                    gestureConfiguration = pinchGesture,
+                    onGestureLabel = "Talk to Grok",
+                    onGesture = { vm.startListening() },
+                )
+                else -> Modifier
             },
         )
         .tapToMuteCurrentReply(enabled = speaking, onTap = vm::toggleResponseMute)
@@ -161,10 +169,13 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
         ScreenScaffold(
             scrollState = listState,
             edgeButton = {
-                // Stop is the bottom edge button while speaking (does not cover the transcript).
+                // Bottom edge button (ScreenScaffold pads the list so it never covers the transcript):
+                // Stop while Grok speaks, Talk while idle, Retry on error, otherwise History.
                 when {
                     speaking ->
                         EdgeButton(onClick = vm::interrupt, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
+                    awaiting ->
+                        EdgeButton(onClick = vm::startListening, buttonSize = EdgeButtonSize.Small) { Text("Talk") }
                     state.error != null && state.errorRetryable && micGranted ->
                         EdgeButton(onClick = vm::retry, buttonSize = EdgeButtonSize.Small) { Text("Retry") }
                     else ->
@@ -184,7 +195,9 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                item { StatusHeader(state, micGranted) }
+                // Top Talk chip lives inside the header list item: it scrolls with the content
+                // (never floats over text) and keeps item indices stable.
+                item { StatusHeader(state, micGranted, onTalk = vm::startListening) }
                 item { VolumeControls(percent = state.volumePercent, onAdjust = vm::adjustVolume) }
 
             items(bubbleParts, key = { "${it.messageLocalId}-${it.partIndex}" }) { part ->
@@ -224,6 +237,13 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
             }
 
             item { Spacer(Modifier.size(4.dp)) }
+            item {
+                FilledTonalButton(
+                    onClick = onOpenHistory,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("History") },
+                )
+            }
             item {
                 FilledTonalButton(
                     onClick = onNewChat,
@@ -332,12 +352,13 @@ private fun VolumeStepButton(label: String, background: Color, onClick: () -> Un
 }
 
 @Composable
-private fun StatusHeader(state: ChatUiState, micGranted: Boolean) {
+private fun StatusHeader(state: ChatUiState, micGranted: Boolean, onTalk: () -> Unit) {
     val (label, color) = when {
         !micGranted -> "Mic permission needed" to MaterialTheme.colorScheme.error
         state.apiKeyMissing -> "API key missing" to MaterialTheme.colorScheme.error
         else -> when (state.status) {
             SessionStatus.IDLE -> "Paused" to Color.Gray
+            SessionStatus.AWAITING -> "Your turn" to Color(0xFFB0BEC5)
             SessionStatus.CONNECTING -> "Connecting…" to Color(0xFFFFC107)
             SessionStatus.LISTENING -> "Listening…" to Color(0xFF4CAF50)
             SessionStatus.HEARING -> "Hearing you…" to Color(0xFF00BCD4)
@@ -386,6 +407,16 @@ private fun StatusHeader(state: ChatUiState, micGranted: Boolean) {
                 textAlign = TextAlign.Center,
             )
         }
+        if (state.status == SessionStatus.AWAITING && micGranted) {
+            Text(
+                "Tap Talk or double-pinch to ask",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.size(4.dp))
+            TalkChip(onTalk)
+        }
         if (state.messages.isEmpty() && state.status == SessionStatus.LISTENING) {
             Text(
                 "Say something…",
@@ -393,6 +424,21 @@ private fun StatusHeader(state: ChatUiState, micGranted: Boolean) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+/** Compact pill-shaped Talk button for the top of the list (small so it never crowds the text). */
+@Composable
+private fun TalkChip(onClick: () -> Unit) {
+    Box(
+        Modifier
+            .height(30.dp)
+            .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(15.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("Talk", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimary)
     }
 }
 

@@ -5,10 +5,10 @@ voice conversation with Grok through the xAI **Grok Voice Agent (speech-to-speec
 
 * **Watch-face complication** ("Talk to Grok": SHORT_TEXT / SMALL_IMAGE / MONOCHROMATIC_IMAGE). Tapping it opens the app.
 * **Listens right away** when opened. It asks for the microphone once, then starts listening on every launch.
-* **Answers by voice**, and you can keep asking follow-ups until you leave the app. The mic and the WebSocket close in `onStop`.
+* **One question per turn.** It listens for your first question on open; once Grok finishes talking (or you Stop it) the mic is fully stopped (`AudioRecord` released, nothing streamed), so no new turn can be triggered. Ask a follow-up with the **Talk** button (a compact chip at the top of the list and the bottom edge button) or a **double-pinch**. If nobody speaks for 30 s after Talk, the mic closes again. The WebSocket stays open between turns; if the server drops it while idle, Talk reconnects transparently and replays the conversation as context. Everything closes in `onStop`.
 * **Live captions** for both you and Grok, in a scrollable, round-screen `ScalingLazyColumn` (Wear Compose Material 3).
 * **History** is stored locally in Room. You can reopen a past conversation and keep going: earlier turns are sent back to Grok as context.
-* Keeps the screen on during a session. Errors like missing key, bad key, no network, or mic busy show a clear message and a Retry button.
+* Keeps the screen on while listening, thinking, or speaking (not while waiting for Talk). Errors like missing key, bad key, no network, or mic busy show a clear message and a Retry button.
 
 ## API choice (from docs.x.ai)
 
@@ -34,10 +34,10 @@ The mic uses the `VOICE_COMMUNICATION` source, with `AcousticEchoCanceler`, `Noi
 By default the app is **half-duplex**: while Grok is talking it sends silence instead of the mic signal, so the watch
 speaker can't trigger the server's voice detection. **Stop** is the bottom edge button while Grok speaks (it does not cover the transcript). It calls `response.cancel`,
 clears local playback, and sends `conversation.item.truncate` so Grok's context matches what you actually heard.
-The same stop action is also the Wear OS **primary one-handed gesture**: `Modifier.oneHandedGesture` with `OneHandedGestureAction.Primary` (Wear Compose Material3 1.7, Wear OS 7). On Pixel Watch that gesture is **double-pinch**. On watches without the gesture framework the library no-ops, and the bottom Stop button still works. The handler is registered only while Grok is speaking, at clickable priority, so it is not a touch-screen pinch detector.
+The same stop action is also the Wear OS **primary one-handed gesture**: `Modifier.oneHandedGesture` with `OneHandedGestureAction.Primary` (Wear Compose Material3 1.7, Wear OS 7). On Pixel Watch that gesture is **double-pinch**. On watches without the gesture framework the library no-ops, and the bottom Stop button still works. The handler is registered only while Grok is speaking (stop) or idle (talk), at clickable priority, so it is not a touch-screen pinch detector.
 **Mute** is a single-finger tap on the screen while Grok is speaking (there is no Mute button). It pauses only the current spoken reply (AudioTrack playback). Captions keep
 updating. Tap again to hear the rest of that same reply. The next assistant turn always starts unmuted. Mute is not saved
-across responses or restarts. Taps on buttons (Stop, volume, New chat, Voice interrupt) and drags that scroll the transcript are not treated as mute. When Grok is not speaking, the bottom edge button is **History** (or **Retry** on a recoverable error).
+across responses or restarts. Taps on buttons (Stop, volume, New chat, Voice interrupt) and drags that scroll the transcript are not treated as mute. When Grok is idle (waiting for your next question) the bottom edge button is **Talk** and double-pinch also starts listening; while listening it is **History** (or **Retry** on a recoverable error). History is also a button in the list, above New chat.
 Turn on **Voice interrupt** in the list to talk over Grok instead. This relies on the watch's echo cancellation.
 
 ### Volume
