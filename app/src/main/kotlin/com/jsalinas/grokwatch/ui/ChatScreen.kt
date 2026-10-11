@@ -122,6 +122,10 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
     val speaking = state.status == SessionStatus.SPEAKING
     // Waiting for the next question: mic closed, Talk / double-pinch opens it.
     val awaiting = state.status == SessionStatus.AWAITING && micGranted
+    // Mic open (or question sent, reply not audible yet): Stop / double-pinch cancels the turn.
+    val listening = micGranted && state.status in setOf(
+        SessionStatus.CONNECTING, SessionStatus.LISTENING, SessionStatus.HEARING, SessionStatus.THINKING,
+    )
 
     // Auto-scroll to the newest text as it streams in (unless the user is scrolling).
     val lastText = messages.lastOrNull()?.text?.length ?: 0
@@ -140,7 +144,8 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
 
     // Primary one-handed gesture: on Pixel Watch this is double-pinch (Wear OS 7).
     // The library no-ops on hardware that does not support the gesture framework.
-    // Same gesture, state-dependent action: stop Grok while it speaks, start listening while idle.
+    // Same gesture, state-dependent action: stop Grok while it speaks, stop listening while the mic
+    // is open / a reply is pending, start listening while idle.
     val pinchGesture = rememberOneHandedGestureConfiguration(
         action = OneHandedGestureAction.Primary,
         gestureId = "grok-pinch",
@@ -154,6 +159,11 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
                     gestureConfiguration = pinchGesture,
                     onGestureLabel = "Stop Grok",
                     onGesture = { vm.interrupt() },
+                )
+                listening -> Modifier.oneHandedGesture(
+                    gestureConfiguration = pinchGesture,
+                    onGestureLabel = "Stop listening",
+                    onGesture = { vm.stopListening() },
                 )
                 awaiting -> Modifier.oneHandedGesture(
                     gestureConfiguration = pinchGesture,
@@ -170,10 +180,13 @@ fun ChatScreen(conversationId: Long, onOpenHistory: () -> Unit, onNewChat: () ->
             scrollState = listState,
             edgeButton = {
                 // Bottom edge button (ScreenScaffold pads the list so it never covers the transcript):
-                // Stop while Grok speaks, Talk while idle, Retry on error, otherwise History.
+                // Stop while Grok speaks or while listening / thinking, Talk while idle,
+                // Retry on error, otherwise History.
                 when {
                     speaking ->
                         EdgeButton(onClick = vm::interrupt, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
+                    listening ->
+                        EdgeButton(onClick = vm::stopListening, buttonSize = EdgeButtonSize.Small) { Text("Stop") }
                     awaiting ->
                         EdgeButton(onClick = vm::startListening, buttonSize = EdgeButtonSize.Small) { Text("Talk") }
                     state.error != null && state.errorRetryable && micGranted ->

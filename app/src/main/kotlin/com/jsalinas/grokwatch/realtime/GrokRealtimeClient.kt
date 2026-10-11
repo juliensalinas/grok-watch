@@ -19,7 +19,8 @@ import java.util.concurrent.TimeUnit
  *
  * Protocol (docs.x.ai → Voice → Speech to Speech):
  *  - WebSocket `wss://api.x.ai/v1/realtime?model=<model>`, header `Authorization: Bearer <key>`
- *  - client: `session.update`, `input_audio_buffer.append` (base64 PCM16), `conversation.item.create`,
+ *  - client: `session.update`, `input_audio_buffer.append` (base64 PCM16), `input_audio_buffer.clear`,
+ *    `conversation.item.create`,
  *    `response.cancel`, `conversation.item.truncate`
  *  - server: `session.updated`, `input_audio_buffer.speech_started/stopped`,
  *    `conversation.item.input_audio_transcription.updated/completed`, `response.created`,
@@ -187,6 +188,11 @@ class GrokRealtimeClient(
                         .put("content", JSONArray().put(JSONObject().put("type", contentType).put("text", text))),
                 ),
         )
+    }
+
+    /** Drop any uncommitted mic audio on the server so it never becomes a user turn. */
+    fun clearInputBuffer() {
+        send(JSONObject().put("type", "input_audio_buffer.clear"))
     }
 
     fun cancelResponse() {

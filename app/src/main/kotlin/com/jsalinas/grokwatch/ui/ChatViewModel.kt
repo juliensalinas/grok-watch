@@ -128,6 +128,16 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     private var responseAudioStartFrame: Long? = null
     private var tickerJob: Job? = null
     private var noticeJob: Job? = null
+    /**
+     * Set when the user stops while listening / thinking: any response the server creates for the
+     * abandoned input is cancelled on arrival and never shown or played. Cleared when the user
+     * starts speaking again after Talk.
+     */
+    @Volatile private var suppressNewResponses = false
+    /** Response ids cancelled because of a listen-stop; their events are ignored. */
+    private val suppressedResponseIds = mutableSetOf<String>()
+    /** Server errors caused by a stop-time clear/cancel race are not shown before this time. */
+    @Volatile private var quietErrorsUntil = 0L
     /** Reused silence buffer for half-duplex mic gate (avoids per-chunk allocations / GC jank). */
     private var silenceBuf: ByteArray = EMPTY_BYTES
 
@@ -206,6 +216,8 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             itemIdToUserLocalId.clear()
             userBubbleItemOrder.clear()
             itemSegmentText.clear()
+            suppressNewResponses = false
+            suppressedResponseIds.clear()
             silenceBuf = EMPTY_BYTES
         }
         // Auto-listen on open: start capturing immediately (buffered until the socket is ready).
@@ -412,6 +424,42 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         _state.update { it.copy(volumePercent = pct) }
     }
 
+    /**
+     * Stop button / double-pinch while listening, hearing, thinking or connecting: close the mic,
+     * drop pending input on the server, cancel any reply already triggered, and wait for Talk.
+     * The partial user caption stays visible.
+     */
+    fun stopListening() {
+        if (!started) return
+        val st = _state.value.status
+        if (st != SessionStatus.LISTENING && st != SessionStatus.HEARING &&
+            st != SessionStatus.THINKING && st != SessionStatus.CONNECTING
+        ) {
+            if (st == SessionStatus.SPEAKING) interrupt()
+            return
+        }
+        closeMic()
+        var sealed: ChatMessage? = null
+        synchronized(lock) {
+            quietErrorsUntil = System.currentTimeMillis() + QUIET_ERRORS_MS
+            preBuffer.clear()
+            val c = client
+            if (wsReady) c?.clearInputBuffer()
+            if (responseActive) {
+                // Reply already triggered (e.g. still "Thinking…"): cancel it; response.done will
+                // finalize whatever caption arrived.
+                interruptLocked(cancelServer = true)
+            }
+            acceptAssistantAudio = false
+            // A VAD commit may already be in flight: cancel any reply it produces.
+            suppressNewResponses = true
+            sealed = sealOpenUserTurnLocked()
+        }
+        sealed?.let { if (it.dbId != null) persistUpdate(it) else persist(it) }
+        thinkingSince = 0L
+        _state.update { it.copy(status = SessionStatus.AWAITING, responseMuted = false) }
+    }
+
     /** Stop button / double-pinch while speaking: cut Grok off and go idle (not listening). */
     fun interrupt() {
         synchronized(lock) { interruptLocked(cancelServer = true) }
@@ -558,7 +606,11 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             }
 
             "input_audio_buffer.speech_started" -> {
+                // Stale VAD event for audio sent before the mic was closed (e.g. after Stop).
+                if (!micOpen) return
                 synchronized(lock) {
+                    // The user is speaking again after Talk: replies are wanted again.
+                    suppressNewResponses = false
                     val p = player
                     if (p != null && p.isAudible() && _state.value.voiceBargeIn) {
                         // Voice barge-in. The server auto-cancels an in-flight response in VAD mode.
@@ -603,6 +655,13 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
 
             "response.created" -> {
                 val rid = e.optJSONObject("response")?.optString("id")?.ifBlank { null }
+                if (suppressNewResponses) {
+                    // Reply to input the user stopped: cancel it, never show or play it.
+                    synchronized(lock) { rid?.let { suppressedResponseIds += it } }
+                    quietErrorsUntil = System.currentTimeMillis() + QUIET_ERRORS_MS
+                    client?.cancelResponse()
+                    return
+                }
                 var sealPersist: ChatMessage? = null
                 synchronized(lock) {
                     // Close the user turn so the next utterance gets a new bubble; late
@@ -628,10 +687,12 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             }
 
             "response.output_item.added" -> synchronized(lock) {
+                if (isSuppressed(e)) return
                 e.optJSONObject("item")?.optString("id")?.ifBlank { null }?.let { currentAssistantItemId = it }
             }
 
             "response.output_audio_transcript.delta", "response.text.delta", "response.output_text.delta" -> {
+                if (isSuppressed(e)) return
                 val delta = e.optString("delta")
                 if (delta.isNotEmpty()) {
                     val rid = e.optString("response_id").ifBlank { null }
@@ -643,6 +704,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             }
 
             "response.output_audio_transcript.done" -> {
+                if (isSuppressed(e)) return
                 val full = e.optString("transcript")
                 if (full.isNotBlank()) {
                     // Authoritative final caption — prefer it over possibly incomplete delta text.
@@ -660,6 +722,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             "response.done" -> {
                 val resp = e.optJSONObject("response")
                 val rid = resp?.optString("id")?.ifBlank { null }
+                if (rid != null && synchronized(lock) { suppressedResponseIds.remove(rid) }) return
                 val status = resp?.optString("status")
                 val embedded = extractAssistantTranscript(resp)
                 synchronized(lock) { responseActive = false }
@@ -709,6 +772,8 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
                             if (isIdleAwaiting()) dropIdleConnection()
                             else failAndStop("Session ended ($code). Tap Retry to continue.", true)
                         }
+                    System.currentTimeMillis() < quietErrorsUntil ->
+                        Log.i(TAG, "Ignoring server error after stop: $code")
                     else -> showNotice(msg.ifBlank { "Server error: $code" })
                 }
             }
@@ -716,6 +781,11 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
     }
 
     // ------------------------------------------------------------------ message helpers
+
+    private fun isSuppressed(e: JSONObject): Boolean {
+        val rid = e.optString("response_id").ifBlank { null } ?: return false
+        return synchronized(lock) { rid in suppressedResponseIds }
+    }
 
     private fun newMessage(role: Role, text: String, itemId: String?, responseId: String? = null) = ChatMessage(
         localId = localIds.getAndIncrement(),
@@ -743,13 +813,17 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             .joinToString(" ")
     }
 
-    private fun beginOpenUserTurn(itemId: String?) {
+    /**
+     * [open] = false creates a caption for a late transcript after the mic was closed (e.g. Stop):
+     * shown, but not an open turn (so it never blocks going idle or merges with the next question).
+     */
+    private fun beginOpenUserTurn(itemId: String?, open: Boolean = true) {
         val msg = newMessage(Role.USER, "", itemId)
-        openUserLocalId = msg.localId
+        if (open) openUserLocalId = msg.localId
         userBubbleItemOrder[msg.localId] = mutableListOf()
         if (itemId != null) {
             rememberUserItem(msg.localId, itemId)
-        } else {
+        } else if (open) {
             pendingUserLocalId = msg.localId
             rememberUserItem(msg.localId, "_pending")
         }
@@ -842,10 +916,11 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
             var idx = resolveUserMessageIndex(msgs, idKey)
             if (idx < 0) {
                 // Completed/updated can race ahead of speech_started (esp. completed-only fallback).
-                beginOpenUserTurn(idKey)
+                if (!micOpen && idKey == null) return
+                beginOpenUserTurn(idKey, open = micOpen)
                 msgs = _state.value.messages.toMutableList()
                 idx = resolveUserMessageIndex(msgs, idKey)
-                if (idx < 0) idx = msgs.indexOfFirst { it.localId == openUserLocalId }
+                if (idx < 0 && micOpen) idx = msgs.indexOfFirst { it.localId == openUserLocalId }
                 if (idx < 0) return
             }
             if (idKey != null && pendingUserLocalId != null) pendingUserLocalId = null
@@ -1080,6 +1155,7 @@ class ChatViewModel(app: Application, initialConversationId: Long) : AndroidView
         private const val LISTEN_TIMEOUT_MS = 30_000L
         /** VAD ended a segment but no response.created followed. */
         private const val NO_RESPONSE_MS = 6_000L
+        private const val QUIET_ERRORS_MS = 3_000L
         private const val MAX_HISTORY_MESSAGES = 40
         private const val MAX_HISTORY_CHARS = 16_000
         private val EMPTY_BYTES = ByteArray(0)
